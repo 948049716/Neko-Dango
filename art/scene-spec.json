@@ -1,0 +1,88 @@
+{
+  "schemaVersion": "1.0.0",
+  "project": "Project-CatDango",
+  "artDirection": {
+    "name": "Soft Mochi Cat Diorama",
+    "rendering": "stylized 3D PBR",
+    "gameplayRepresentation": "2.5D constrained rigid bodies",
+    "view": "portrait near-front container view"
+  },
+  "coordinates": {
+    "upAxis": "+Y",
+    "screenHorizontalAxis": "+X",
+    "defaultFrontAxis": "+Z",
+    "playPlane": "Z=0",
+    "engineUnitsPer100Lu": 1,
+    "assetForward": "+Z"
+  },
+  "container": {
+    "playableWidthEu": 6.4,
+    "dangerHeightEu": 6.6,
+    "physicsInvariantAcrossThemes": true,
+    "visualThemes": [
+      "classic-wicker",
+      "kotatsu-plush",
+      "strawberry-box",
+      "space-pod"
+    ]
+  },
+  "camera": {
+    "projection": "perspective",
+    "fovDegrees": 30,
+    "targetOwner": "ContainerFocus",
+    "yawMinDegrees": -16,
+    "yawMaxDegrees": 16,
+    "pitchLocked": true,
+    "distanceLocked": true,
+    "yawAxis": "+Y",
+    "gestureAxis": "screen-X",
+    "smoothingMilliseconds": 120,
+    "maxReleaseInertiaMilliseconds": 180,
+    "autoCenterOnRelease": false
+  },
+  "interactionZones": {
+    "dropAim": "top drop zone",
+    "cameraYaw": "container frame, background, and side margins",
+    "cameraLockedStates": [
+      "PropTargeting",
+      "DangerFinalSecond",
+      "Result",
+      "AdResume"
+    ]
+  },
+  "physics": {
+    "translationLocks": ["Z"],
+    "allowedTranslationAxes": ["X", "Y"],
+    "allowedRotationAxes": ["Z"],
+    "catCollider": "sphere",
+    "visualMeshSeparatedFromCollider": true,
+    "cameraDoesNotChangeSimulation": true
+  },
+  "deformation": {
+    "model": "approximate 3D volume conservation",
+    "crossAxisRule": "scaleX=scaleZ=1/sqrt(scaleY)",
+    "maxVolumeErrorPercent": 8
+  },
+  "lighting": {
+    "keyAzimuthDegrees": -35,
+    "keyElevationDegrees": 50,
+    "dynamicShadowLights": 1,
+    "windowCastsTransparentShadow": false,
+    "preserveCameraOnThemeChange": true
+  },
+  "concepts": {
+    "mainGameplay": "concepts/CONCEPT_main_gameplay.png",
+    "props": "concepts/CONCEPT_props_sheet.png",
+    "environmentThemes": "concepts/CONCEPT_environment_themes.png",
+    "cameraYawTriptych": "concepts/CONCEPT_camera_yaw_triptych.png"
+  },
+  "validationViews": [
+    "yaw--16",
+    "yaw-0",
+    "yaw-16",
+    "neutral-material",
+    "maximum-squash",
+    "maximum-stretch",
+    "twenty-cat-performance"
+  ]
+}
