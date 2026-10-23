@@ -40,3 +40,28 @@ npm run typecheck # 严格类型检查
 
 M0 通过条件（docs/技术选型.md 第 7 节）：1000 局规则模拟不重复消费、不生成 Lv12。
 引擎场景内的接触与真机性能验证不在无头范围内，随 M1 垂直切片进行。
+
+## 预制 Cocos 工程（M1 起点，2026-10-23）
+
+`client/` 已预制为可直接导入的 Cocos Creator 3.8 工程：工程 `package.json`、`settings/`（设计分辨率 750×1334、宽度适配）、全部资源的 `.meta`、手工编排的 `assets/scenes/Game.scene`（102 个对象：主光源/主相机/Canvas+HUD/GameRoot，脚本绑定已预接线），以及引擎侧脚本：
+
+- `assets/scripts/bootstrap/GameBootstrap.ts`：装配与固定步进主循环、事件接线、预览猫、复活/结算/重开。
+- `assets/scripts/presentation/BulletPhysicsAdapter.ts`：Bullet 适配（球碰撞体、静态容器、接触对、冲击波、Z 轴锁定），接口与无头替身一致。
+- `assets/scripts/presentation/HudView.ts` / `InputView.ts`：HUD 视图与输入（设计坐标换算）。
+- 引擎侧类型检查：仓库根 `npm run typecheck:prefab`（对照官方 `@cocos/creator-types` 3.8.8）。
+- 工程文件由 `tools/gen_cocos_project.py` 生成（可重复运行，已有 uuid 会被复用）；场景图一致性由该脚本自检。
+
+### 在编辑器中打开（Windows / macOS）
+
+1. 安装 Cocos Creator 3.8.x（LTS），用 Dashboard「导入」选择仓库的 `client/` 目录打开。
+2. 打开 `assets/scenes/Game.scene`，在「构建发布」中把它设为启动场景。
+3. **做猫预制体**：新建节点加内置球体网格（半径 0.5），存为 Prefab（如 `assets/prefabs/Cat.prefab`），拖到 GameRoot 上 GameBootstrap 的 `catPrefab` 字段。不做也能运行（代码会生成占位球体节点），但没有正式形象。
+4. 首次打开核对清单（手工编排工程的已知不确定点，编辑器若自动修正属正常）：
+   - 主相机 `Main Camera` 的投影应为 Perspective、FOV 30；UI 相机为 Orthographic。
+   - GameRoot 的 GameBootstrap 六个绑定（configAsset/worldRoot/containerRoot/hud/input）应均有值，catPrefab 为空属预期。
+   - `game-config.json` 若被重新导入（meta 版本自愈），uuid 不变即可，绑定不受影响。
+
+### 已知未完成（按里程碑）
+
+- M1 后续：猫预制体的正式视觉（M2 低模替换占位球体）、容器视觉（编织猫窝按 ENV 设定建模）、相机偏航（scene-spec ±16°）、果冻形变的事件钩子已在 GameBootstrap 中留位。
+- 道具栏目前为静态文案（道具规则属 M3）；Next 显示为等级文字（图鉴式小猫预览属 M2 表现）。
