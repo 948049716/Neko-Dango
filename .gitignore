@@ -1,0 +1,6 @@
+node_modules/
+build-test/
+client/library/
+client/temp/
+client/local/
+.DS_Store

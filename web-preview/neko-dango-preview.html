@@ -1,0 +1,1532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>猫咪团子 · M0 灰盒预览</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #EFE0C6; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 14px 0; box-sizing: border-box; }
+  canvas { height: min(92vh, 92vw * 1334 / 750); aspect-ratio: 750 / 1334; border-radius: 18px; box-shadow: 0 18px 50px rgba(90, 64, 56, .35); touch-action: none; background: #F8ECD8; }
+  .tip { color: #7A5B4A; font-size: 13px; text-align: center; line-height: 1.7; padding: 0 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="1500" height="2668"></canvas>
+  <div class="tip">M0 灰盒预览 · 移动鼠标/手指瞄准，松手（或点击）投放猫咪 · 左上角「自动」可开演示模式<br>规则与数值来自仓库正式配置，画面为 Canvas 占位表现，道具、装扮与 3D 模型未接入</div>
+</div>
+<script>
+"use strict";
+(() => {
+  var __defProp = Object.defineProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
+
+  // client/assets/scripts/domain/GameConfig.ts
+  var MAX_LEVEL = 11;
+  function catByLevel(cfg2, level) {
+    const cat = cfg2.cats[level - 1];
+    if (!cat) throw new Error(`\u4E0D\u5B58\u5728\u7684\u732B\u54AA\u7B49\u7EA7\uFF1A${level}`);
+    return cat;
+  }
+
+  // client/assets/scripts/domain/DangerRules.ts
+  var DangerRules = class {
+    constructor(cfg2) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "overSinceById", /* @__PURE__ */ new Map());
+      __publicField(this, "countdownDeadlineTick", -1);
+      __publicField(this, "allClearSinceTick", -1);
+    }
+    get inCountdown() {
+      return this.countdownDeadlineTick >= 0;
+    }
+    get deadlineTick() {
+      return this.countdownDeadlineTick;
+    }
+    /**
+     * overEntityIds 为本 tick 顶边越过危险线的有效实体集合（已排除 Preview/Falling/Merge/Despawn）。
+     */
+    update(tick, overEntityIds) {
+      for (const id of [...this.overSinceById.keys()]) {
+        if (!overEntityIds.has(id)) this.overSinceById.delete(id);
+      }
+      for (const id of overEntityIds) {
+        if (!this.overSinceById.has(id)) this.overSinceById.set(id, tick);
+      }
+      if (!this.inCountdown) {
+        for (const since of this.overSinceById.values()) {
+          if (tick - since >= this.cfg.rules.dangerTriggerTicks) {
+            this.countdownDeadlineTick = tick + this.cfg.rules.dangerCountdownTicks;
+            this.allClearSinceTick = -1;
+            return "countdownStarted";
+          }
+        }
+        return "none";
+      }
+      if (overEntityIds.size === 0) {
+        if (this.allClearSinceTick < 0) this.allClearSinceTick = tick;
+        if (tick - this.allClearSinceTick >= this.cfg.rules.dangerClearTicks) {
+          this.reset();
+          return "cleared";
+        }
+      } else {
+        this.allClearSinceTick = -1;
+      }
+      if (tick >= this.countdownDeadlineTick) {
+        return "failed";
+      }
+      return "none";
+    }
+    reset() {
+      this.overSinceById.clear();
+      this.countdownDeadlineTick = -1;
+      this.allClearSinceTick = -1;
+    }
+  };
+
+  // client/assets/scripts/domain/MergeRules.ts
+  function pairKey(aId, bId) {
+    return aId < bId ? `${aId}:${bId}` : `${bId}:${aId}`;
+  }
+  var MergeCoordinator = class {
+    constructor(cfg2) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "contacts", /* @__PURE__ */ new Map());
+      __publicField(this, "txns", /* @__PURE__ */ new Map());
+      __publicField(this, "nextTxnId", 1);
+    }
+    get pendingCount() {
+      return this.txns.size;
+    }
+    isReserved(entityId) {
+      for (const txn of this.txns.values()) {
+        if (txn.aId === entityId || txn.bId === entityId) return true;
+      }
+      return false;
+    }
+    /** 每 tick 喂入接触对，维护连续接触计时；未在本 tick 出现的接触对视为中断并清零。 */
+    updateContacts(tick, pairs) {
+      const seen = /* @__PURE__ */ new Set();
+      for (const pair of pairs) {
+        if (pair.aId === pair.bId) continue;
+        const key = pairKey(pair.aId, pair.bId);
+        seen.add(key);
+        const track = this.contacts.get(key);
+        if (track && track.lastTick === tick - 1) {
+          track.lastTick = tick;
+        } else {
+          this.contacts.set(key, { sinceTick: tick, lastTick: tick });
+        }
+      }
+      for (const key of [...this.contacts.keys()]) {
+        if (!seen.has(key)) this.contacts.delete(key);
+      }
+    }
+    /**
+     * 挑选本 tick 可预占的合成对。
+     * isEligible 判断实体是否处于可结算且未被预占的状态，levelOf 返回实体等级。
+     */
+    findCandidates(tick, pairs, isEligible, levelOf) {
+      const speedByKey = /* @__PURE__ */ new Map();
+      for (const pair of pairs) {
+        if (pair.aId === pair.bId) continue;
+        speedByKey.set(pairKey(pair.aId, pair.bId), pair.normalRelSpeedLuS);
+      }
+      const sortedPairs = [...speedByKey.entries()].sort((x, y) => x[0] < y[0] ? -1 : 1);
+      const used = /* @__PURE__ */ new Set();
+      const result = [];
+      for (const [key, speed] of sortedPairs) {
+        const track = this.contacts.get(key);
+        if (!track) continue;
+        if (tick - track.sinceTick + 1 < this.cfg.rules.mergeContactTicks) continue;
+        if (speed >= this.cfg.rules.mergeMaxNormalSpeedLuS) continue;
+        const [aId, bId] = key.split(":").map(Number);
+        if (used.has(aId) || used.has(bId)) continue;
+        if (!isEligible(aId) || !isEligible(bId)) continue;
+        const level = levelOf(aId);
+        if (level !== levelOf(bId) || level > MAX_LEVEL) continue;
+        used.add(aId);
+        used.add(bId);
+        result.push({ aId, bId, level });
+      }
+      return result;
+    }
+    /** 预占一对实体并登记事务，返回提交 tick。 */
+    reserve(tick, aId, bId, level) {
+      const commitTicks = level >= MAX_LEVEL ? this.cfg.rules.dualTopLevelCommitTicks : this.cfg.rules.mergeCommitTicks;
+      const txn = {
+        txnId: this.nextTxnId++,
+        aId,
+        bId,
+        level,
+        reservedTick: tick,
+        commitTick: tick + commitTicks
+      };
+      this.txns.set(txn.txnId, txn);
+      return txn;
+    }
+    /** 取出本 tick 到期的事务（提交后即从未完成集合移除）。 */
+    collectDue(tick) {
+      const due = [];
+      for (const txn of this.txns.values()) {
+        if (tick >= txn.commitTick) due.push(txn);
+      }
+      due.sort((x, y) => x.txnId - y.txnId);
+      for (const txn of due) this.txns.delete(txn.txnId);
+      return due;
+    }
+    /** 局面冻结或重开时取消全部未完成事务。 */
+    cancelAll() {
+      this.txns.clear();
+      this.contacts.clear();
+    }
+  };
+
+  // client/assets/scripts/domain/Rng.ts
+  var Rng = class {
+    constructor(seed) {
+      __publicField(this, "state");
+      this.state = seed >>> 0;
+    }
+    /** 返回 [0, 1) 的浮点数，并推进状态。 */
+    nextFloat() {
+      this.state = this.state + 1831565813 >>> 0;
+      let t = this.state;
+      t = Math.imul(t ^ t >>> 15, t | 1);
+      t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    }
+    /** 返回 [0, maxExclusive) 的整数。 */
+    nextInt(maxExclusive) {
+      return Math.floor(this.nextFloat() * maxExclusive);
+    }
+    /** 按权重抽取下标，权重为正数数组。 */
+    pickWeighted(weights) {
+      let total = 0;
+      for (const w of weights) total += w;
+      let roll = this.nextFloat() * total;
+      for (let i = 0; i < weights.length; i++) {
+        roll -= weights[i];
+        if (roll < 0) return i;
+      }
+      return weights.length - 1;
+    }
+    /** 当前内部状态，用于存档与回放校验。 */
+    snapshotState() {
+      return this.state;
+    }
+    restoreState(state) {
+      this.state = state >>> 0;
+    }
+  };
+
+  // client/assets/scripts/domain/ScoreRules.ts
+  var ScoreRules = class {
+    constructor(cfg2) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "combo", 0);
+      __publicField(this, "lastMergeTick", -1);
+      __publicField(this, "fiveComboRewardClaimed", false);
+    }
+    /** 一次普通合成提交时调用，返回本次得分与连击信息。 */
+    onMergeCommitted(tick, createdLevel) {
+      const baseScore = this.cfg.cats[createdLevel - 1].baseScore;
+      if (this.lastMergeTick >= 0 && tick - this.lastMergeTick <= this.cfg.rules.comboWindowTicks) {
+        this.combo += 1;
+      } else {
+        this.combo = 1;
+      }
+      this.lastMergeTick = tick;
+      const table = this.cfg.rules.comboMultipliers;
+      const multiplier = table[Math.min(this.combo, table.length) - 1];
+      const gainedScore = Math.round(baseScore * multiplier);
+      let fiveComboReward = null;
+      let fiveComboBonus = 0;
+      if (this.combo === 5) {
+        if (!this.fiveComboRewardClaimed) {
+          fiveComboReward = "RainbowBall";
+          this.fiveComboRewardClaimed = true;
+        } else {
+          fiveComboReward = "BonusScore";
+          fiveComboBonus = this.cfg.rules.fiveComboRepeatScore;
+        }
+      }
+      return { baseScore, combo: this.combo, multiplier, gainedScore, fiveComboReward, fiveComboBonus };
+    }
+    /** 双 Lv11 清场固定 4096 分，不套用基础分与倍率；但刷新连击窗口。 */
+    onTopLevelPairCleared(tick) {
+      if (this.lastMergeTick >= 0 && tick - this.lastMergeTick <= this.cfg.rules.comboWindowTicks) {
+        this.combo += 1;
+      } else {
+        this.combo = 1;
+      }
+      this.lastMergeTick = tick;
+      return this.cfg.rules.dualTopLevelScore;
+    }
+    get currentCombo() {
+      return this.combo;
+    }
+  };
+
+  // client/assets/scripts/domain/SpawnPolicy.ts
+  var SpawnPolicy = class {
+    constructor(cfg2) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "phaseIndex", 0);
+      __publicField(this, "pendingPhase", -1);
+      __publicField(this, "pendingSinceTick", -1);
+      __publicField(this, "recentLevels", []);
+      __publicField(this, "unpairableStreak", 0);
+      __publicField(this, "pityArmed", false);
+    }
+    get currentPhaseIndex() {
+      return this.phaseIndex;
+    }
+    /** 每 tick 以当前堆叠高度比例推进阶段切换判定。 */
+    updatePhase(tick, stackHeightRatio) {
+      const { phaseThresholds, phaseHysteresis, phaseHoldTicks } = this.cfg.spawn;
+      let desired = this.phaseIndex;
+      if (this.phaseIndex < 2 && stackHeightRatio >= phaseThresholds[this.phaseIndex] + phaseHysteresis) {
+        desired = this.phaseIndex + 1;
+      } else if (this.phaseIndex > 0 && stackHeightRatio < phaseThresholds[this.phaseIndex - 1] - phaseHysteresis) {
+        desired = this.phaseIndex - 1;
+      }
+      if (desired === this.phaseIndex) {
+        this.pendingPhase = -1;
+        this.pendingSinceTick = -1;
+        return;
+      }
+      if (this.pendingPhase !== desired) {
+        this.pendingPhase = desired;
+        this.pendingSinceTick = tick;
+        return;
+      }
+      if (tick - this.pendingSinceTick >= phaseHoldTicks) {
+        this.phaseIndex = desired;
+        this.pendingPhase = -1;
+        this.pendingSinceTick = -1;
+      }
+    }
+    /**
+     * 抽取下一只猫。fieldSettledLevels 为当前场上已结算猫咪的等级集合（用于可配对判定）。
+     * 抽取结果在投放时即固定，Next 预览与之一致。
+     */
+    draw(rng, fieldSettledLevels) {
+      let level;
+      let lucky = false;
+      if (this.pityArmed && fieldSettledLevels.size > 0) {
+        level = Math.min(...fieldSettledLevels);
+        lucky = true;
+        this.pityArmed = false;
+        this.unpairableStreak = 0;
+      } else {
+        const weights = [...this.cfg.spawn.phases[this.phaseIndex].weightsPercent];
+        const last2 = this.recentLevels[this.recentLevels.length - 1];
+        if (last2 !== void 0 && this.recentLevels.length >= this.cfg.spawn.maxSameLevelStreak && this.recentLevels.slice(-this.cfg.spawn.maxSameLevelStreak).every((lv) => lv === last2)) {
+          weights[last2 - 1] = 0;
+        }
+        level = rng.pickWeighted(weights) + 1;
+        if (fieldSettledLevels.has(level)) {
+          this.unpairableStreak = 0;
+        } else {
+          this.unpairableStreak += 1;
+          if (this.unpairableStreak >= this.cfg.spawn.luckyPityStreak) {
+            this.pityArmed = true;
+            this.unpairableStreak = 0;
+          }
+        }
+      }
+      this.recentLevels.push(level);
+      if (this.recentLevels.length > 16) this.recentLevels.shift();
+      return { level, lucky };
+    }
+  };
+
+  // client/assets/scripts/domain/Types.ts
+  var CONTAINER_ID = 0;
+
+  // client/assets/scripts/application/GameSession.ts
+  var INHERIT_SPEED_CAP_LU_S = 120;
+  var GameSession = class {
+    constructor(cfg2, opts) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "rng");
+      __publicField(this, "spawnPolicy");
+      __publicField(this, "scoreRules");
+      __publicField(this, "dangerRules");
+      __publicField(this, "mergeCoordinator");
+      __publicField(this, "entities", /* @__PURE__ */ new Map());
+      __publicField(this, "lastBodies", /* @__PURE__ */ new Map());
+      __publicField(this, "nextEntityId", 1);
+      __publicField(this, "tick", 0);
+      __publicField(this, "_phase", "Playing");
+      __publicField(this, "_score", 0);
+      __publicField(this, "currentDraw");
+      __publicField(this, "nextDraw");
+      /** 新手局固定序列（主策划 2.2），非新手局为 null。 */
+      __publicField(this, "tutorialDraws", null);
+      __publicField(this, "tutorialIndex", 0);
+      __publicField(this, "lastDropTick", Number.NEGATIVE_INFINITY);
+      __publicField(this, "lastDropEntityId", 0);
+      __publicField(this, "reviveUsed", false);
+      __publicField(this, "reviveResumeTick", -1);
+      __publicField(this, "runId");
+      __publicField(this, "epoch");
+      this.runId = opts.runId;
+      this.epoch = opts.epoch;
+      this.rng = new Rng(opts.seed);
+      this.spawnPolicy = new SpawnPolicy(cfg2);
+      this.scoreRules = new ScoreRules(cfg2);
+      this.dangerRules = new DangerRules(cfg2);
+      this.mergeCoordinator = new MergeCoordinator(cfg2);
+      if (opts.tutorial) {
+        const seq = cfg2.spawn.tutorialSequence;
+        this.tutorialDraws = [...seq];
+        this.currentDraw = { level: seq[0] ?? 1, lucky: false };
+        this.nextDraw = { level: seq[1] ?? 1, lucky: false };
+        this.tutorialIndex = 2;
+      } else {
+        this.currentDraw = this.drawFromPolicy();
+        this.nextDraw = this.drawFromPolicy();
+      }
+    }
+    get phase() {
+      return this._phase;
+    }
+    get score() {
+      return this._score;
+    }
+    get currentTick() {
+      return this.tick;
+    }
+    /** 当前待投放与 Next 预览（投放时即固定，不随位置改变）。 */
+    get preview() {
+      return { current: this.currentDraw, next: this.nextDraw };
+    }
+    get aliveEntities() {
+      return [...this.entities.values()];
+    }
+    entityById(entityId) {
+      return this.entities.get(entityId);
+    }
+    settledLevels() {
+      const levels = /* @__PURE__ */ new Set();
+      for (const e of this.entities.values()) {
+        if (e.state === "Settled") levels.add(e.level);
+      }
+      return levels;
+    }
+    drawFromPolicy() {
+      return this.spawnPolicy.draw(this.rng, this.settledLevels());
+    }
+    advanceDrawQueue() {
+      this.currentDraw = this.nextDraw;
+      if (this.tutorialDraws && this.tutorialIndex < this.tutorialDraws.length) {
+        this.nextDraw = { level: this.tutorialDraws[this.tutorialIndex], lucky: false };
+        this.tutorialIndex += 1;
+      } else {
+        this.nextDraw = this.drawFromPolicy();
+      }
+    }
+    /** 是否允许在当前 tick 释放预览猫（主策划 2.1 第 2、3 条与架构第 7 节的投放节奏）。 */
+    canDrop(tick) {
+      if (this._phase !== "Playing") return false;
+      if (this.mergeCoordinator.pendingCount > 0) return false;
+      if (tick - this.lastDropTick < this.cfg.rules.dropShowDelayTicks) return false;
+      if (this.lastDropEntityId !== 0) {
+        const prev = this.entities.get(this.lastDropEntityId);
+        const prevSettled = !prev || prev.firstContactTick >= 0 || prev.state === "Despawn";
+        if (!prevSettled && tick - this.lastDropTick < this.cfg.rules.dropFirstContactTimeoutTicks) {
+          return false;
+        }
+      }
+      return true;
+    }
+    /** 释放当前预览猫。返回实体 ID，不允许时返回 0。 */
+    drop(xLu, tick) {
+      if (!this.canDrop(tick)) return { entityId: 0, events: [], directives: [] };
+      const level = this.currentDraw.level;
+      const radius = catByLevel(this.cfg, level).radiusLu;
+      const clampedX = Math.min(
+        Math.max(xLu, radius),
+        this.cfg.world.containerWidthLu - radius
+      );
+      const entity = {
+        entityId: this.nextEntityId++,
+        generation: 1,
+        level,
+        state: "Falling",
+        firstContactTick: -1,
+        reservedByTxn: 0
+      };
+      this.entities.set(entity.entityId, entity);
+      this.lastDropTick = tick;
+      this.lastDropEntityId = entity.entityId;
+      const yLu = this.cfg.headlessSim.spawnYLu;
+      const events = [
+        { type: "CatDropped", tick, entityId: entity.entityId, level, xLu: clampedX }
+      ];
+      const directives = [
+        { type: "SpawnBody", entityId: entity.entityId, level, xLu: clampedX, yLu, vxLuS: 0, vyLuS: 0 }
+      ];
+      this.advanceDrawQueue();
+      return { entityId: entity.entityId, events, directives };
+    }
+    /** 推进一个逻辑 tick。快照 tick 必须单调递增。 */
+    step(snapshot) {
+      const events = [];
+      const directives = [];
+      this.tick = snapshot.tick;
+      if (this._phase === "Reviving") {
+        if (snapshot.tick >= this.reviveResumeTick) {
+          this._phase = "Playing";
+          events.push({ type: "RunRevived", tick: snapshot.tick });
+        } else {
+          return { events, directives };
+        }
+      }
+      if (this._phase === "Frozen" || this._phase === "Settled") {
+        return { events, directives };
+      }
+      this.lastBodies = new Map(snapshot.bodies.map((b) => [b.entityId, b]));
+      for (const pair of snapshot.contacts) {
+        for (const id of [pair.aId, pair.bId]) {
+          if (id === CONTAINER_ID) continue;
+          const entity = this.entities.get(id);
+          if (entity && entity.state === "Falling") {
+            entity.state = "Settled";
+            entity.firstContactTick = snapshot.tick;
+            events.push({ type: "CatFirstContact", tick: snapshot.tick, entityId: id });
+          }
+        }
+      }
+      this.mergeCoordinator.updateContacts(snapshot.tick, snapshot.contacts);
+      const isEligible = (id) => {
+        const e = this.entities.get(id);
+        return !!e && e.state === "Settled" && !this.mergeCoordinator.isReserved(id);
+      };
+      const levelOf = (id) => this.entities.get(id)?.level ?? 0;
+      for (const cand of this.mergeCoordinator.findCandidates(snapshot.tick, snapshot.contacts, isEligible, levelOf)) {
+        const txn = this.mergeCoordinator.reserve(snapshot.tick, cand.aId, cand.bId, cand.level);
+        for (const id of [cand.aId, cand.bId]) {
+          const e = this.entities.get(id);
+          e.state = "MergeReserved";
+          e.reservedByTxn = txn.txnId;
+        }
+        events.push({
+          type: "MergeReserved",
+          tick: snapshot.tick,
+          txnId: txn.txnId,
+          aId: cand.aId,
+          bId: cand.bId,
+          level: cand.level,
+          commitTick: txn.commitTick
+        });
+      }
+      for (const txn of this.mergeCoordinator.collectDue(snapshot.tick)) {
+        this.commitMerge(txn.txnId, txn.aId, txn.bId, txn.level, snapshot.tick, events, directives);
+      }
+      let maxTop = 0;
+      for (const e of this.entities.values()) {
+        if (e.state !== "Settled") continue;
+        const body = this.lastBodies.get(e.entityId);
+        if (!body) continue;
+        maxTop = Math.max(maxTop, body.yLu + catByLevel(this.cfg, e.level).radiusLu);
+      }
+      this.spawnPolicy.updatePhase(snapshot.tick, maxTop / this.cfg.world.dangerLineYLu);
+      const over = /* @__PURE__ */ new Set();
+      for (const e of this.entities.values()) {
+        if (e.state !== "Settled") continue;
+        const body = this.lastBodies.get(e.entityId);
+        if (!body) continue;
+        if (body.yLu + catByLevel(this.cfg, e.level).radiusLu > this.cfg.world.dangerLineYLu) {
+          over.add(e.entityId);
+        }
+      }
+      const dangerResult = this.dangerRules.update(snapshot.tick, over);
+      if (dangerResult === "countdownStarted") {
+        this._phase = "DangerCountdown";
+        events.push({
+          type: "DangerCountdownStarted",
+          tick: snapshot.tick,
+          deadlineTick: this.dangerRules.deadlineTick
+        });
+      } else if (dangerResult === "cleared") {
+        this._phase = "Playing";
+        events.push({ type: "DangerCleared", tick: snapshot.tick });
+      } else if (dangerResult === "failed") {
+        this.onRunFailed(snapshot.tick, events);
+      }
+      return { events, directives };
+    }
+    commitMerge(txnId, aId, bId, level, tick, events, directives) {
+      const a = this.entities.get(aId);
+      const b = this.entities.get(bId);
+      if (!a || !b || a.state !== "MergeReserved" || b.state !== "MergeReserved") return;
+      const bodyA = this.lastBodies.get(aId);
+      const bodyB = this.lastBodies.get(bId);
+      const cx = bodyA && bodyB ? (bodyA.xLu + bodyB.xLu) / 2 : this.cfg.world.containerWidthLu / 2;
+      const cy = bodyA && bodyB ? (bodyA.yLu + bodyB.yLu) / 2 : catByLevel(this.cfg, level).radiusLu;
+      this.removeEntity(aId, directives);
+      this.removeEntity(bId, directives);
+      if (level >= MAX_LEVEL) {
+        const gained = this.scoreRules.onTopLevelPairCleared(tick);
+        this._score += gained;
+        events.push({ type: "TopLevelPairCleared", tick, txnId, gainedScore: gained });
+        return;
+      }
+      const newLevel = level + 1;
+      const entity = {
+        entityId: this.nextEntityId++,
+        generation: 1,
+        level: newLevel,
+        state: "Settled",
+        firstContactTick: tick,
+        reservedByTxn: 0
+      };
+      this.entities.set(entity.entityId, entity);
+      let vx = bodyA && bodyB ? (bodyA.vxLuS + bodyB.vxLuS) / 2 : 0;
+      let vy = bodyA && bodyB ? (bodyA.vyLuS + bodyB.vyLuS) / 2 : 0;
+      const speed = Math.hypot(vx, vy);
+      if (speed > INHERIT_SPEED_CAP_LU_S) {
+        vx = vx / speed * INHERIT_SPEED_CAP_LU_S;
+        vy = vy / speed * INHERIT_SPEED_CAP_LU_S;
+      }
+      directives.push({
+        type: "SpawnBody",
+        entityId: entity.entityId,
+        level: newLevel,
+        xLu: cx,
+        yLu: cy,
+        vxLuS: vx,
+        vyLuS: vy
+      });
+      const scored = this.scoreRules.onMergeCommitted(tick, newLevel);
+      this._score += scored.gainedScore + scored.fiveComboBonus;
+      events.push({
+        type: "MergeCommitted",
+        tick,
+        txnId,
+        newEntityId: entity.entityId,
+        level: newLevel,
+        xLu: cx,
+        yLu: cy,
+        baseScore: scored.baseScore,
+        combo: scored.combo,
+        multiplier: scored.multiplier,
+        gainedScore: scored.gainedScore
+      });
+      if (scored.fiveComboReward) {
+        events.push({
+          type: "FiveComboReached",
+          tick,
+          reward: scored.fiveComboReward,
+          bonusScore: scored.fiveComboBonus
+        });
+      }
+      directives.push({ type: "ApplyShockwave", xLu: cx, yLu: cy, sourceLevel: newLevel });
+    }
+    removeEntity(entityId, directives) {
+      const e = this.entities.get(entityId);
+      if (!e) return;
+      e.state = "Despawn";
+      this.entities.delete(entityId);
+      directives.push({ type: "RemoveBody", entityId });
+    }
+    onRunFailed(tick, events) {
+      this._phase = "Frozen";
+      this.mergeCoordinator.cancelAll();
+      for (const e of this.entities.values()) {
+        if (e.state === "MergeReserved") {
+          e.state = "Settled";
+          e.reservedByTxn = 0;
+        }
+      }
+      events.push({ type: "RunFailed", tick });
+    }
+    /** 复活：按顶边高度降序、ID 升序移除最高两只合法猫，全体清零速度，0.30s 后恢复。一局一次。 */
+    revive(tick) {
+      const events = [];
+      const directives = [];
+      if (this._phase !== "Frozen" || this.reviveUsed) return { events, directives };
+      this.reviveUsed = true;
+      const candidates = [...this.entities.values()].filter((e) => e.state === "Settled").map((e) => {
+        const body = this.lastBodies.get(e.entityId);
+        const top = body ? body.yLu + catByLevel(this.cfg, e.level).radiusLu : 0;
+        return { e, top };
+      }).sort((x, y) => y.top - x.top || x.e.entityId - y.e.entityId);
+      const removed = [];
+      for (const { e } of candidates.slice(0, 2)) {
+        removed.push(e.entityId);
+        this.removeEntity(e.entityId, directives);
+      }
+      for (const e of this.entities.values()) {
+        directives.push({ type: "ZeroVelocity", entityId: e.entityId });
+      }
+      this.dangerRules.reset();
+      this._phase = "Reviving";
+      this.reviveResumeTick = tick + this.cfg.rules.reviveWaitTicks;
+      events.push({ type: "CatsRemovedForRevive", tick, entityIds: removed });
+      return { events, directives };
+    }
+    /** 放弃复活进入结算。 */
+    settle() {
+      if (this._phase === "Frozen") this._phase = "Settled";
+    }
+  };
+
+  // tests/HeadlessPhysics.ts
+  var MAX_SPEED_LU_S = 1600;
+  var HeadlessPhysics = class {
+    constructor(cfg2) {
+      __publicField(this, "cfg", cfg2);
+      __publicField(this, "bodies", /* @__PURE__ */ new Map());
+    }
+    get bodyCount() {
+      return this.bodies.size;
+    }
+    bodyOf(entityId) {
+      return this.bodies.get(entityId);
+    }
+    applyDirectives(directives) {
+      for (const d of directives) {
+        switch (d.type) {
+          case "SpawnBody": {
+            const cat = catByLevel(this.cfg, d.level);
+            this.bodies.set(d.entityId, {
+              entityId: d.entityId,
+              level: d.level,
+              x: d.xLu,
+              y: d.yLu,
+              vx: d.vxLuS,
+              vy: d.vyLuS,
+              r: cat.radiusLu,
+              m: cat.mass,
+              e: cat.restitution,
+              touching: false
+            });
+            break;
+          }
+          case "RemoveBody":
+            this.bodies.delete(d.entityId);
+            break;
+          case "ZeroVelocity": {
+            const b = this.bodies.get(d.entityId);
+            if (b) {
+              b.vx = 0;
+              b.vy = 0;
+            }
+            break;
+          }
+          case "ApplyShockwave":
+            this.applyShockwave(d.xLu, d.yLu, d.sourceLevel);
+            break;
+        }
+      }
+    }
+    /** 合成冲击波：径向推力，向上分量衰减至 30%，危险线以上对象不接受向上冲量，单体增量封顶。 */
+    applyShockwave(x, y, sourceLevel) {
+      const { shockwaveUpwardKeepRatio, shockwaveMaxDeltaVelocityLuS } = this.cfg.rules;
+      const sourceR = catByLevel(this.cfg, sourceLevel).radiusLu;
+      const influence = sourceR * 2 + 160;
+      for (const b of this.bodies.values()) {
+        const dx = b.x - x;
+        const dy = b.y - y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 1 || dist > influence + b.r) continue;
+        const falloff = Math.max(0, 1 - dist / (influence + b.r));
+        let dvx = dx / dist * falloff * 220;
+        let dvy = dy / dist * falloff * 220;
+        if (dvy > 0) {
+          const top = b.y + b.r;
+          dvy = top > this.cfg.world.dangerLineYLu ? 0 : dvy * shockwaveUpwardKeepRatio;
+        }
+        const mag = Math.hypot(dvx, dvy);
+        if (mag > shockwaveMaxDeltaVelocityLuS) {
+          dvx = dvx / mag * shockwaveMaxDeltaVelocityLuS;
+          dvy = dvy / mag * shockwaveMaxDeltaVelocityLuS;
+        }
+        b.vx += dvx;
+        b.vy += dvy;
+      }
+    }
+    /** 推进一个逻辑 tick（内部按配置子步进）。 */
+    step() {
+      const { gravityLuS2, substeps, restVelocityLuS } = this.cfg.headlessSim;
+      const dt = 1 / this.cfg.tickRate / substeps;
+      const width = this.cfg.world.containerWidthLu;
+      for (let s = 0; s < substeps; s++) {
+        const arr = [...this.bodies.values()].sort((a, b) => a.entityId - b.entityId);
+        for (const b of arr) {
+          b.touching = false;
+          b.vy -= gravityLuS2 * dt;
+          const speed = Math.hypot(b.vx, b.vy);
+          if (speed > MAX_SPEED_LU_S) {
+            b.vx = b.vx / speed * MAX_SPEED_LU_S;
+            b.vy = b.vy / speed * MAX_SPEED_LU_S;
+          }
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+          if (b.y < b.r) {
+            b.y = b.r;
+            if (b.vy < 0) b.vy = Math.abs(b.vy) > 30 ? -b.vy * b.e : 0;
+            b.vx *= 0.98;
+            b.touching = true;
+          }
+          if (b.x < b.r) {
+            b.x = b.r;
+            if (b.vx < 0) b.vx = Math.abs(b.vx) > 30 ? -b.vx * b.e : 0;
+            b.touching = true;
+          } else if (b.x > width - b.r) {
+            b.x = width - b.r;
+            if (b.vx > 0) b.vx = Math.abs(b.vx) > 30 ? -b.vx * b.e : 0;
+            b.touching = true;
+          }
+        }
+        const byX = [...arr].sort((a, b) => a.x - b.x || a.entityId - b.entityId);
+        for (let i = 0; i < byX.length; i++) {
+          const a = byX[i];
+          for (let j = i + 1; j < byX.length; j++) {
+            const b = byX[j];
+            if (b.x - a.x > a.r + b.r) break;
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const minDist = a.r + b.r;
+            const distSq = dx * dx + dy * dy;
+            if (distSq >= minDist * minDist || distSq === 0) continue;
+            const dist = Math.sqrt(distSq);
+            const nx = dx / dist;
+            const ny = dy / dist;
+            const overlap = minDist - dist;
+            const invA = 1 / a.m;
+            const invB = 1 / b.m;
+            const invSum = invA + invB;
+            const corr = Math.max(0, overlap - 0.5) * 0.8;
+            a.x -= nx * corr * (invA / invSum);
+            a.y -= ny * corr * (invA / invSum);
+            b.x += nx * corr * (invB / invSum);
+            b.y += ny * corr * (invB / invSum);
+            const rvx = b.vx - a.vx;
+            const rvy = b.vy - a.vy;
+            const vn = rvx * nx + rvy * ny;
+            if (vn < 0) {
+              const e = Math.min(a.e, b.e);
+              const jimp = -(1 + e) * vn / invSum;
+              a.vx -= jimp * nx * invA;
+              a.vy -= jimp * ny * invA;
+              b.vx += jimp * nx * invB;
+              b.vy += jimp * ny * invB;
+              const tx = -ny;
+              const ty = nx;
+              const vt = rvx * tx + rvy * ty;
+              const fimp = vt * 0.08 / invSum;
+              a.vx += fimp * tx * invA;
+              a.vy += fimp * ty * invA;
+              b.vx -= fimp * tx * invB;
+              b.vy -= fimp * ty * invB;
+            }
+            a.touching = true;
+            b.touching = true;
+          }
+        }
+        for (const b of arr) {
+          if (b.touching && Math.hypot(b.vx, b.vy) < restVelocityLuS) {
+            b.vx *= 0.8;
+            b.vy *= 0.8;
+          }
+        }
+      }
+    }
+    /** 生成本 tick 的规则层快照：刚体列表与接触对（几何判定，含与容器底的接触）。 */
+    snapshot(tick) {
+      const arr = [...this.bodies.values()].sort((a, b) => a.entityId - b.entityId);
+      const bodies = arr.map((b) => ({
+        entityId: b.entityId,
+        xLu: b.x,
+        yLu: b.y,
+        vxLuS: b.vx,
+        vyLuS: b.vy
+      }));
+      const contacts = [];
+      for (const b of arr) {
+        if (b.y - b.r <= 1) {
+          contacts.push({ aId: b.entityId, bId: CONTAINER_ID, normalRelSpeedLuS: Math.abs(b.vy) });
+        }
+      }
+      const byX = [...arr].sort((a, b) => a.x - b.x || a.entityId - b.entityId);
+      for (let i = 0; i < byX.length; i++) {
+        const a = byX[i];
+        for (let j = i + 1; j < byX.length; j++) {
+          const b = byX[j];
+          if (b.x - a.x > a.r + b.r + 1) break;
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist > a.r + b.r + 1 || dist === 0) continue;
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const rel = Math.abs((b.vx - a.vx) * nx + (b.vy - a.vy) * ny);
+          contacts.push({ aId: a.entityId, bId: b.entityId, normalRelSpeedLuS: rel });
+        }
+      }
+      return { tick, bodies, contacts };
+    }
+  };
+
+  // client/assets/configs/game-config.json
+  var game_config_default = { cats: [{ baseScore: 0, codexLine: "\u522B\u626F\u6211\u8EAB\u4E0A\u7684\u84DD\u6BDB\u7EBF\uFF0C\u4F1A\u6563\u67B6\u54D2~", displayWeightKg: 0.2, level: 1, mass: 1, name: "\u5976\u840C\u6BDB\u7EBF\u7403", radiusLu: 26, restitution: 0.45 }, { baseScore: 2, codexLine: "\u9ED1\u767D\u914D\uFF0C\u5FEB\u4E50\u7FFB\u500D\uFF01\u4ECA\u5929\u4E5F\u8981\u8E29\u5976\uFF01", displayWeightKg: 0.5, level: 2, mass: 1.5, name: "\u5976\u725B\u5C0F\u6BDB\u56E2", radiusLu: 34, restitution: 0.42 }, { baseScore: 4, codexLine: "\u53EA\u8981\u6211\u6B6A\u4E00\u6B6A\u5934\uFF0C\u5C0F\u9C7C\u5E72\u5C31\u4F1A\u81EA\u5DF1\u98DE\u8FC7\u6765\u3002", displayWeightKg: 1.2, level: 3, mass: 2.3, name: "\u8F6F\u840C\u5E03\u5076\u732B", radiusLu: 44, restitution: 0.38 }, { baseScore: 8, codexLine: "\u547C\u565C\u2026\u2026\u518D\u7761\u4E94\u5206\u949F\uFF0C\u68A6\u91CC\u5168\u662F\u5927\u7F50\u5934\u2026\u2026", displayWeightKg: 2.5, level: 4, mass: 3.5, name: "\u8D2A\u7761\u4E09\u82B1\u732B", radiusLu: 56, restitution: 0.35 }, { baseScore: 16, codexLine: "\u54FC\uFF0C\u8FD9\u6761\u5C0F\u9C7C\u5E72\u624D\u4E0D\u662F\u7559\u7ED9\u4F60\u7684\uFF01", displayWeightKg: 4.2, level: 5, mass: 5.2, name: "\u50B2\u5A07\u7F8E\u77ED\u732B", radiusLu: 70, restitution: 0.32 }, { baseScore: 32, codexLine: "\u54A6\uFF1F\u5DE6\u8FB9\u7684\u6211\u548C\u53F3\u8FB9\u7684\u6211\uFF0C\u54EA\u4E2A\u66F4\u9ED1\u4E00\u70B9\uFF1F", displayWeightKg: 6.8, level: 6, mass: 7.5, name: "\u5446\u840C\u66B9\u7F57\u732B", radiusLu: 86, restitution: 0.28 }, { baseScore: 64, codexLine: "\u62A5\u544A\uFF01\u732B\u7A9D\u79E9\u5E8F\u826F\u597D\uFF0C\u672A\u53D1\u73B0\u5077\u5403\u5ACC\u7591\u55B5\uFF01", displayWeightKg: 10.5, level: 7, mass: 10.5, name: "\u9ED1\u732B\u5DE1\u903B\u957F", radiusLu: 104, restitution: 0.25 }, { baseScore: 128, codexLine: "\u522B\u50AC\u6211\u51CF\u80A5\uFF0C\u8FD9\u53EB\u9971\u6EE1\u7684\u667A\u6167\u3002", displayWeightKg: 15, level: 8, mass: 14.5, name: "\u80A5\u7F8E\u82F1\u77ED\u84DD\u732B", radiusLu: 124, restitution: 0.22 }, { baseScore: 256, codexLine: "\u4E0D\u662F\u6211\u80D6\uFF0C\u662F\u732B\u7A9D\u663E\u5C0F\u3002", displayWeightKg: 21, level: 9, mass: 19.5, name: "\u5927\u6A58\u4E3A\u91CD", radiusLu: 146, restitution: 0.18 }, { baseScore: 512, codexLine: "\u9677\u8FDB\u6211\u7684\u4E91\u6735\u9B03\u6BDB\u91CC\uFF0C\u70E6\u607C\u90FD\u4F1A\u6D88\u5931\u54E6\u3002", displayWeightKg: 32, level: 10, mass: 26, name: "\u8F6F\u7CEF\u767D\u72EE\u5927\u732B", radiusLu: 166, restitution: 0.15 }, { baseScore: 1024, codexLine: "\u6EE1\u7A9D\u661F\u5149\u95EA\u8000\uFF0C\u5168\u5B87\u5B99\u7684\u732B\u54AA\u90FD\u4E3A\u4F60\u795D\u798F\uFF01", displayWeightKg: 50, level: 11, mass: 35, name: "\u5B87\u5B99\u7A76\u6781\u9EC4\u91D1\u5DE8\u732B", radiusLu: 180, restitution: 0.1 }], headlessSim: { comment: "\u4EC5\u4F9B\u65E0\u5934\u89C4\u5219\u6D4B\u8BD5\u7684\u7070\u76D2\u7269\u7406\u8C03\u53C2\uFF0C\u4E0D\u662F\u6B63\u5F0F Bullet \u7269\u7406\u53C2\u6570", gravityLuS2: 2600, restVelocityLuS: 5, spawnYLu: 980, substeps: 2 }, rules: { comboMultipliers: [1, 1.15, 1.35, 1.6, 2], comboWindowTicks: 72, dangerClearTicks: 18, dangerCountdownTicks: 180, dangerTriggerTicks: 36, dropFirstContactTimeoutTicks: 54, dropShowDelayTicks: 21, dualTopLevelCommitTicks: 36, dualTopLevelScore: 4096, fiveComboRepeatScore: 200, mergeCommitTicks: 27, mergeContactTicks: 3, mergeMaxNormalSpeedLuS: 80, reviveWaitTicks: 18, shockwaveMaxDeltaVelocityLuS: 260, shockwaveUpwardKeepRatio: 0.3 }, spawn: { luckyPityStreak: 8, maxSameLevelStreak: 3, phaseHoldTicks: 30, phaseHysteresis: 0.03, phaseThresholds: [0.4, 0.65], phases: [{ name: "initial", weightsPercent: [40, 35, 20, 5] }, { name: "middle", weightsPercent: [30, 35, 25, 10] }, { name: "danger", weightsPercent: [20, 30, 35, 15] }], tutorialSequence: [1, 1, 2] }, tickRate: 60, version: "2.2.0-m0", world: { containerWidthLu: 640, dangerLineYLu: 660, unitsPerMeter: 100 } };
+
+  // web-preview/main.ts
+  var cfg = game_config_default;
+  var W = 750;
+  var H = 1334;
+  var X0 = 55;
+  var CW = cfg.world.containerWidthLu;
+  var BY = 1150;
+  var DANGER_Y = BY - cfg.world.dangerLineYLu;
+  var SPAWN_SCREEN_Y = BY - cfg.headlessSim.spawnYLu;
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+  ctx.scale(2, 2);
+  var COLORS = {
+    cream: "#FFF9EF",
+    ink: "#5A4038",
+    coral: "#E9857D",
+    coralDark: "#D64541",
+    honey: "#C98A46",
+    gold: "#F4C75B",
+    mint: "#6FA9A3"
+  };
+  var CAT_BODY = {
+    1: "#F6C7D8",
+    2: "#FBF8F2",
+    3: "#F1DFC8",
+    4: "#FCFAF5",
+    5: "#B7BEC7",
+    6: "#EFE0C8",
+    7: "#403A3E",
+    8: "#93A9BF",
+    9: "#F0A04B",
+    10: "#FAF5EC",
+    11: "#F2B63D"
+  };
+  var visuals = /* @__PURE__ */ new Map();
+  var particles = [];
+  var floaters = [];
+  var session;
+  var physics;
+  var tickNo = 0;
+  var aimGameX = CW / 2;
+  var deadlineTick = -1;
+  var reviveAvailable = false;
+  var maxLevel = 0;
+  var lastCombo = 0;
+  var lastComboTick = -999;
+  var auto = false;
+  var autoRng = new Rng(20261023);
+  var fxRng = new Rng(777);
+  function newRun(seed) {
+    session = new GameSession(cfg, { runId: "preview", epoch: 1, seed });
+    physics = new HeadlessPhysics(cfg);
+    tickNo = 0;
+    deadlineTick = -1;
+    reviveAvailable = false;
+    maxLevel = 0;
+    lastCombo = 0;
+    visuals.clear();
+    particles.length = 0;
+    floaters.length = 0;
+  }
+  newRun(20261023);
+  function handleEvents(events) {
+    for (const e of events) {
+      switch (e.type) {
+        case "CatFirstContact": {
+          const vis = visuals.get(e.entityId);
+          if (vis) vis.v -= 5.2;
+          break;
+        }
+        case "MergeCommitted": {
+          maxLevel = Math.max(maxLevel, e.level);
+          lastCombo = e.combo;
+          lastComboTick = e.tick;
+          const sx = X0 + e.xLu;
+          const sy = BY - e.yLu;
+          for (let i = 0; i < 12; i++) {
+            const ang = fxRng.nextFloat() * Math.PI * 2;
+            const spd = 60 + fxRng.nextFloat() * 190;
+            particles.push({
+              x: sx,
+              y: sy,
+              vx: Math.cos(ang) * spd,
+              vy: Math.sin(ang) * spd - 60,
+              life: 0,
+              maxLife: 0.55 + fxRng.nextFloat() * 0.3,
+              r: 4 + fxRng.nextFloat() * 6,
+              color: [COLORS.gold, COLORS.coral, "#FFD9E8", "#BFE3DE"][fxRng.nextInt(4)]
+            });
+          }
+          floaters.push({
+            x: sx,
+            y: sy - 10,
+            text: `+${e.gainedScore}`,
+            life: 0,
+            color: COLORS.ink,
+            size: e.combo >= 3 ? 44 : 34
+          });
+          if (e.combo >= 2) {
+            floaters.push({
+              x: sx,
+              y: sy - 58,
+              text: `${e.combo} \u8FDE\u51FB!`,
+              life: 0,
+              color: COLORS.coralDark,
+              size: 30
+            });
+          }
+          break;
+        }
+        case "TopLevelPairCleared":
+          floaters.push({
+            x: W / 2,
+            y: 420,
+            text: `\u6EE1\u7A9D\u56E2\u5706 +${e.gainedScore}`,
+            life: 0,
+            color: "#B97F16",
+            size: 46
+          });
+          break;
+        case "FiveComboReached":
+          floaters.push({
+            x: W / 2,
+            y: 360,
+            text: e.reward === "RainbowBall" ? "5 \u8FDE\u51FB\uFF01\u83B7\u5F97\u9B54\u6CD5\u5F69\u8679\u7403" : "5 \u8FDE\u51FB\uFF01+200 \u5206",
+            life: 0,
+            color: COLORS.coralDark,
+            size: 32
+          });
+          break;
+        case "DangerCountdownStarted":
+          deadlineTick = e.deadlineTick;
+          break;
+        case "DangerCleared":
+          deadlineTick = -1;
+          break;
+        case "RunFailed":
+          deadlineTick = -1;
+          reviveAvailable = true;
+          break;
+        case "CatsRemovedForRevive":
+          reviveAvailable = false;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  function doDrop(gameX) {
+    const res = session.drop(gameX, tickNo);
+    if (res.entityId > 0) {
+      physics.applyDirectives(res.directives);
+      handleEvents(res.events);
+      if (!visuals.has(res.entityId)) visuals.set(res.entityId, { s: 1, v: 0 });
+    }
+  }
+  function tickOnce() {
+    tickNo += 1;
+    if (auto && session.canDrop(tickNo)) {
+      const alive = session.aliveEntities;
+      if (alive.length > 0 && autoRng.nextFloat() < 0.7) {
+        const target = alive[autoRng.nextInt(alive.length)];
+        const b = physics.bodyOf(target.entityId);
+        aimGameX = (b ? b.x : CW / 2) + (autoRng.nextFloat() * 90 - 45);
+      } else {
+        aimGameX = 40 + autoRng.nextFloat() * (CW - 80);
+      }
+      doDrop(aimGameX);
+    }
+    physics.step();
+    const res = session.step(physics.snapshot(tickNo));
+    physics.applyDirectives(res.directives);
+    handleEvents(res.events);
+    for (const id of [...visuals.keys()]) {
+      if (!physics.bodyOf(id)) visuals.delete(id);
+    }
+    for (const e of session.aliveEntities) {
+      if (!visuals.has(e.entityId)) visuals.set(e.entityId, { s: 1, v: 0 });
+    }
+  }
+  function drawCat(c, level, cx, cy, r, squash, alpha) {
+    c.save();
+    c.globalAlpha = alpha;
+    c.translate(cx, cy);
+    c.scale(1 / Math.sqrt(squash), squash);
+    const body = CAT_BODY[level] ?? "#EEE";
+    const lw = Math.max(1.6, r * 0.05);
+    if (level === 10) {
+      c.fillStyle = "#FFFFFF";
+      for (let i = 0; i < 12; i++) {
+        const a = i / 12 * Math.PI * 2;
+        c.beginPath();
+        c.arc(Math.cos(a) * r * 0.82, Math.sin(a) * r * 0.82, r * 0.34, 0, Math.PI * 2);
+        c.fill();
+      }
+    }
+    c.fillStyle = level === 6 ? "#6B4F3A" : body;
+    c.strokeStyle = "rgba(90,64,56,0.35)";
+    c.lineWidth = lw;
+    for (const dir of [-1, 1]) {
+      c.beginPath();
+      c.moveTo(dir * r * 0.52, -r * 0.62);
+      c.quadraticCurveTo(dir * r * 0.62, -r * 1.12, dir * r * 0.94, -r * 0.98);
+      c.quadraticCurveTo(dir * r * 0.98, -r * 0.6, dir * r * 0.8, -r * 0.42);
+      c.closePath();
+      c.fill();
+    }
+    const grad = c.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.2, 0, 0, r * 1.05);
+    grad.addColorStop(0, "#FFFFFF");
+    grad.addColorStop(0.25, body);
+    grad.addColorStop(1, body);
+    c.fillStyle = level === 11 ? grad : body;
+    c.beginPath();
+    c.arc(0, 0, r, 0, Math.PI * 2);
+    c.fill();
+    c.strokeStyle = "rgba(90,64,56,0.22)";
+    c.stroke();
+    if (level === 2 || level === 4) {
+      c.fillStyle = level === 2 ? "#3A3532" : "#E8975A";
+      c.beginPath();
+      c.arc(-r * 0.45, -r * 0.5, r * 0.26, 0, Math.PI * 2);
+      c.arc(r * 0.55, r * 0.28, r * 0.2, 0, Math.PI * 2);
+      c.fill();
+      if (level === 4) {
+        c.fillStyle = "#4A4038";
+        c.beginPath();
+        c.arc(r * 0.5, -r * 0.55, r * 0.18, 0, Math.PI * 2);
+        c.fill();
+      }
+    }
+    if (level === 5) {
+      c.strokeStyle = "#7E8894";
+      c.lineWidth = lw * 1.2;
+      for (const off of [-0.45, 0, 0.45]) {
+        c.beginPath();
+        c.arc(off * r, -r * 1.25, r * 0.62, Math.PI * 0.25, Math.PI * 0.75);
+        c.stroke();
+      }
+    }
+    if (level === 6) {
+      c.fillStyle = "#6B4F3A";
+      c.beginPath();
+      c.ellipse(0, r * 0.28, r * 0.52, r * 0.42, 0, 0, Math.PI * 2);
+      c.fill();
+    }
+    if (level === 9) {
+      c.fillStyle = "#FCEBD2";
+      c.beginPath();
+      c.ellipse(0, r * 0.38, r * 0.52, r * 0.42, 0, 0, Math.PI * 2);
+      c.fill();
+    }
+    if (level === 7) {
+      c.strokeStyle = COLORS.coralDark;
+      c.lineWidth = r * 0.13;
+      c.beginPath();
+      c.arc(0, r * 0.1, r * 0.86, Math.PI * 0.25, Math.PI * 0.75);
+      c.stroke();
+      c.fillStyle = COLORS.gold;
+      c.beginPath();
+      c.arc(0, r * 0.88, r * 0.13, 0, Math.PI * 2);
+      c.fill();
+    }
+    const eyeY = -r * 0.08;
+    c.strokeStyle = level === 7 || level === 6 ? "#2E2622" : COLORS.ink;
+    c.lineWidth = lw * 1.15;
+    c.lineCap = "round";
+    for (const dir of [-1, 1]) {
+      c.beginPath();
+      c.arc(dir * r * 0.33, eyeY + r * 0.06, r * 0.13, Math.PI * 1.08, Math.PI * 1.92);
+      c.stroke();
+    }
+    c.beginPath();
+    c.arc(-r * 0.07, r * 0.16, r * 0.075, Math.PI * 0.15, Math.PI * 1.15);
+    c.arc(r * 0.07, r * 0.16, r * 0.075, Math.PI * 0.85, Math.PI * 1.85);
+    c.stroke();
+    c.fillStyle = "rgba(244,143,135,0.55)";
+    for (const dir of [-1, 1]) {
+      c.beginPath();
+      c.ellipse(dir * r * 0.55, r * 0.14, r * 0.13, r * 0.08, 0, 0, Math.PI * 2);
+      c.fill();
+    }
+    if (level === 1) {
+      c.fillStyle = "#7FB2E5";
+      c.beginPath();
+      c.moveTo(r * 0.55, -r * 0.88);
+      c.lineTo(r * 0.92, -r * 1.05);
+      c.lineTo(r * 0.9, -r * 0.66);
+      c.closePath();
+      c.moveTo(r * 0.55, -r * 0.88);
+      c.lineTo(r * 0.24, -r * 1.08);
+      c.lineTo(r * 0.26, -r * 0.64);
+      c.closePath();
+      c.fill();
+    }
+    if (level === 11) {
+      c.fillStyle = COLORS.gold;
+      c.strokeStyle = COLORS.honey;
+      c.lineWidth = lw;
+      c.beginPath();
+      const cw = r * 0.62;
+      const ch = r * 0.34;
+      const baseY = -r * 1.02;
+      c.moveTo(-cw / 2, baseY);
+      c.lineTo(-cw / 2, baseY - ch * 0.55);
+      c.lineTo(-cw / 4, baseY - ch * 0.2);
+      c.lineTo(0, baseY - ch);
+      c.lineTo(cw / 4, baseY - ch * 0.2);
+      c.lineTo(cw / 2, baseY - ch * 0.55);
+      c.lineTo(cw / 2, baseY);
+      c.closePath();
+      c.fill();
+      c.stroke();
+    }
+    c.restore();
+  }
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+  var reviveBtn = { x: 215, y: 648, w: 320, h: 78 };
+  var restartBtn = { x: 215, y: 748, w: 320, h: 78 };
+  var autoBtn = { x: 28, y: 118, w: 132, h: 48 };
+  function render(dt) {
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#F8ECD8");
+    bg.addColorStop(1, "#F1DFC2");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = COLORS.honey;
+    roundRect(ctx, 38, 438, W - 76, 742, 40);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(122,79,34,0.45)";
+    ctx.lineWidth = 3;
+    for (let y = 486; y < 1170; y += 44) {
+      ctx.beginPath();
+      ctx.moveTo(48, y);
+      ctx.lineTo(W - 48, y);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(255,251,244,0.38)";
+    roundRect(ctx, X0, 468, CW, BY - 468 + 2, 26);
+    ctx.fill();
+    ctx.fillStyle = "rgba(243,184,198,0.75)";
+    ctx.beginPath();
+    ctx.ellipse(W / 2, BY - 12, CW / 2 - 16, 26, 0, 0, Math.PI * 2);
+    ctx.fill();
+    const bodies = [...physicsSnapshotBodies()].sort((a, b) => a.yLu - b.yLu);
+    for (const b of bodies) {
+      const e = session.entityById(b.entityId);
+      if (!e) continue;
+      const vis = visuals.get(b.entityId) ?? { s: 1, v: 0 };
+      vis.v += (-(vis.s - 1) * 170 - vis.v * 13) * dt;
+      vis.s += vis.v * dt;
+      const falling = e.state === "Falling";
+      const stretch = falling ? 1 + Math.min(Math.abs(b.vyLuS) / 9e3, 0.1) : 1;
+      drawCat(ctx, e.level, X0 + b.xLu, BY - b.yLu, catByLevel(cfg, e.level).radiusLu, vis.s * stretch, 1);
+    }
+    const inDanger = deadlineTick >= 0;
+    ctx.save();
+    ctx.strokeStyle = inDanger ? COLORS.coralDark : COLORS.coral;
+    ctx.lineWidth = inDanger ? 5 : 3.5;
+    ctx.setLineDash(inDanger ? [] : [16, 12]);
+    ctx.beginPath();
+    ctx.moveTo(X0, DANGER_Y);
+    ctx.lineTo(X0 + CW, DANGER_Y);
+    ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = inDanger ? COLORS.coralDark : COLORS.coral;
+    ctx.font = "600 21px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(inDanger ? "\u6EA2\u51FA\u8B66\u62A5\uFF01" : "\u732B\u7A9D\u6EA2\u51FA\u8B66\u62A5\u7EBF", X0 + CW - 6, DANGER_Y - 12);
+    if (inDanger) {
+      const secs = Math.max(0, Math.ceil((deadlineTick - tickNo) / 60));
+      ctx.fillStyle = COLORS.coralDark;
+      ctx.font = "800 92px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(String(secs), W / 2, 428);
+    }
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        particles.splice(i, 1);
+        continue;
+      }
+      p.vy += 620 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      ctx.globalAlpha = 1 - p.life / p.maxLife;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      const f = floaters[i];
+      f.life += dt;
+      if (f.life > 1.1) {
+        floaters.splice(i, 1);
+        continue;
+      }
+      ctx.globalAlpha = f.life < 0.8 ? 1 : 1 - (f.life - 0.8) / 0.3;
+      ctx.fillStyle = f.color;
+      ctx.font = `800 ${f.size}px 'PingFang SC','Microsoft YaHei',sans-serif`;
+      ctx.textAlign = "center";
+      ctx.fillText(f.text, f.x, f.y - f.life * 56);
+    }
+    ctx.globalAlpha = 1;
+    const phase = session.phase;
+    if (phase === "Playing" || phase === "DangerCountdown") {
+      const cur = session.preview.current;
+      const r = catByLevel(cfg, cur.level).radiusLu;
+      const gx = Math.min(Math.max(aimGameX, r), CW - r);
+      const sx = X0 + gx;
+      const alpha = phase === "Playing" ? 1 : 0.45;
+      if (phase === "Playing") {
+        ctx.save();
+        ctx.strokeStyle = "rgba(90,64,56,0.4)";
+        ctx.lineWidth = 3;
+        ctx.setLineDash([4, 14]);
+        ctx.beginPath();
+        ctx.moveTo(sx, SPAWN_SCREEN_Y + r * 0.7);
+        ctx.lineTo(sx, BY - 16);
+        ctx.stroke();
+        ctx.restore();
+        ctx.fillStyle = "rgba(90,64,56,0.16)";
+        ctx.beginPath();
+        ctx.ellipse(sx, BY - 10, r * 0.95, 10, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      drawCat(ctx, cur.level, sx, SPAWN_SCREEN_Y, r, 1, alpha);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "#FFF6E8";
+      ctx.strokeStyle = "rgba(90,64,56,0.25)";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.ellipse(sx, SPAWN_SCREEN_Y - r - 14, 36, 27, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#F4A9B8";
+      for (const off of [-24, -8, 8, 24]) {
+        ctx.beginPath();
+        ctx.ellipse(sx + off, SPAWN_SCREEN_Y - r - 30, 7.5, 10, 0, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+      if (cur.lucky) {
+        ctx.fillStyle = "#B97F16";
+        ctx.font = "700 22px 'PingFang SC','Microsoft YaHei',sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("\u5E78\u8FD0\u6BDB\u7403!", sx, SPAWN_SCREEN_Y - r - 52);
+      }
+    }
+    ctx.fillStyle = COLORS.cream;
+    ctx.beginPath();
+    ctx.arc(64, 66, 34, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,64,56,0.3)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.fillStyle = COLORS.ink;
+    for (let i = 0; i < 8; i++) {
+      const a = i / 8 * Math.PI * 2;
+      ctx.save();
+      ctx.translate(64, 66);
+      ctx.rotate(a);
+      ctx.fillRect(-4.5, -21, 9, 10);
+      ctx.restore();
+    }
+    ctx.beginPath();
+    ctx.arc(64, 66, 11, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.cream;
+    ctx.beginPath();
+    ctx.arc(64, 66, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.cream;
+    roundRect(ctx, 218, 30, 314, 72, 36);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,64,56,0.2)";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = COLORS.ink;
+    ctx.font = "800 37px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(`\u5206\u6570 ${session.score}`, 375, 79);
+    if (lastCombo >= 2 && tickNo - lastComboTick <= cfg.rules.comboWindowTicks) {
+      ctx.fillStyle = COLORS.coralDark;
+      ctx.font = "700 24px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.fillText(`${lastCombo} \u8FDE\u51FB`, 375, 128);
+    }
+    ctx.fillStyle = COLORS.cream;
+    roundRect(ctx, 596, 22, 126, 106, 24);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,64,56,0.2)";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = COLORS.mint;
+    ctx.font = "800 21px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Next", 659, 50);
+    const next = session.preview.next;
+    drawCat(ctx, next.level, 659, 88, Math.min(30, catByLevel(cfg, next.level).radiusLu * 0.5), 1, 1);
+    ctx.fillStyle = auto ? COLORS.coral : COLORS.cream;
+    roundRect(ctx, autoBtn.x, autoBtn.y, autoBtn.w, autoBtn.h, 24);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(90,64,56,0.25)";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = auto ? "#FFFFFF" : COLORS.ink;
+    ctx.font = "700 23px 'PingFang SC','Microsoft YaHei',sans-serif";
+    ctx.fillText(auto ? "\u81EA\u52A8 \u5F00" : "\u81EA\u52A8 \u5173", autoBtn.x + autoBtn.w / 2, autoBtn.y + 32);
+    const props = [
+      { name: "\u9017\u732B\u68D2", count: 2, color: "#E8B54D" },
+      { name: "\u9999\u9165\u9C7C\u5E72", count: 1, color: "#C97B4A" },
+      { name: "\u9B54\u6CD5\u5F69\u8679\u7403", count: 0, color: "#B9A8C9" },
+      { name: "\u5439\u98CE\u673A", count: 1, color: "#F2A0B5" }
+    ];
+    props.forEach((p, i) => {
+      const x = 43 + i * 170;
+      const y = 1196;
+      ctx.fillStyle = COLORS.cream;
+      roundRect(ctx, x, y, 158, 112, 22);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(90,64,56,0.18)";
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+      ctx.globalAlpha = p.count === 0 ? 0.35 : 1;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(x + 79, y + 42, 21, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = COLORS.ink;
+      ctx.font = "700 22px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(p.name, x + 79, y + 92);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = p.count === 0 ? "#A79B92" : COLORS.coral;
+      ctx.beginPath();
+      ctx.arc(x + 132, y + 16, 17, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#FFFFFF";
+      ctx.font = "800 21px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.fillText(`\xD7${p.count}`, x + 132, y + 24);
+    });
+    if (phase === "Frozen" || phase === "Settled") {
+      ctx.fillStyle = "rgba(64,42,32,0.45)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = COLORS.cream;
+      roundRect(ctx, 155, 430, 440, 430, 30);
+      ctx.fill();
+      ctx.fillStyle = COLORS.ink;
+      ctx.font = "800 42px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(phase === "Frozen" ? "\u732B\u7A9D\u6EA2\u51FA\u5566\uFF01" : "\u672C\u5C40\u7ED3\u7B97", W / 2, 505);
+      ctx.font = "800 56px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.fillText(`${session.score} \u5206`, W / 2, 580);
+      ctx.font = "600 25px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.fillStyle = "rgba(90,64,56,0.75)";
+      const topCat = maxLevel > 0 ? catByLevel(cfg, maxLevel) : null;
+      ctx.fillText(topCat ? `\u6700\u9AD8\u5408\u6210\uFF1ALv${maxLevel} ${topCat.name}` : "\u8FD8\u6CA1\u6709\u5408\u6210\u8BB0\u5F55", W / 2, 625);
+      if (phase === "Frozen" && reviveAvailable) {
+        ctx.fillStyle = COLORS.coral;
+        roundRect(ctx, reviveBtn.x, reviveBtn.y, reviveBtn.w, reviveBtn.h, 39);
+        ctx.fill();
+        ctx.fillStyle = "#FFFFFF";
+        ctx.font = "800 31px 'PingFang SC','Microsoft YaHei',sans-serif";
+        ctx.fillText("\u590D\u6D3B\u4E00\u6B21\uFF08\u79FB\u8D70\u6700\u9AD8\u4E24\u53EA\uFF09", W / 2, reviveBtn.y + 50);
+      }
+      ctx.fillStyle = COLORS.cream;
+      roundRect(ctx, restartBtn.x, restartBtn.y, restartBtn.w, restartBtn.h, 39);
+      ctx.fill();
+      ctx.strokeStyle = COLORS.coral;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.fillStyle = COLORS.coralDark;
+      ctx.font = "800 31px 'PingFang SC','Microsoft YaHei',sans-serif";
+      ctx.fillText("\u518D\u6765\u4E00\u5C40", W / 2, restartBtn.y + 50);
+    }
+  }
+  function physicsSnapshotBodies() {
+    return physics.snapshot(tickNo).bodies;
+  }
+  function toDesign(ev) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: (ev.clientX - rect.left) / rect.width * W,
+      y: (ev.clientY - rect.top) / rect.height * H
+    };
+  }
+  function inRect(x, y, r) {
+    return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  }
+  canvas.addEventListener("pointermove", (ev) => {
+    const p = toDesign(ev);
+    aimGameX = p.x - X0;
+  });
+  canvas.addEventListener("pointerdown", (ev) => {
+    const p = toDesign(ev);
+    if (inRect(p.x, p.y, autoBtn)) {
+      auto = !auto;
+      return;
+    }
+    aimGameX = p.x - X0;
+  });
+  canvas.addEventListener("pointerup", (ev) => {
+    const p = toDesign(ev);
+    const phase = session.phase;
+    if (phase === "Frozen" || phase === "Settled") {
+      if (phase === "Frozen" && reviveAvailable && inRect(p.x, p.y, reviveBtn)) {
+        const res = session.revive(tickNo);
+        physics.applyDirectives(res.directives);
+        handleEvents(res.events);
+        return;
+      }
+      if (inRect(p.x, p.y, restartBtn)) {
+        newRun(Date.now() % 1e5 + 7);
+      }
+      return;
+    }
+    if (inRect(p.x, p.y, autoBtn)) return;
+    aimGameX = p.x - X0;
+    if (session.canDrop(tickNo)) doDrop(aimGameX);
+  });
+  var STEP = 1 / 60;
+  var acc = 0;
+  var last = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    let dt = (now - last) / 1e3;
+    last = now;
+    if (dt > 0.25) dt = 0.25;
+    acc += dt;
+    while (acc >= STEP) {
+      tickOnce();
+      acc -= STEP;
+    }
+    render(dt);
+  }
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
