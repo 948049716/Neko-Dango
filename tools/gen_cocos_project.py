@@ -2,7 +2,11 @@
 """生成《猫咪团子》Cocos Creator 3.8 预制工程（client/）。
 
 产出：工程 package.json / tsconfig / settings（设计分辨率 750×1334）/ .gitignore、
-assets 下全部目录与文件的 .meta、assets/scenes/Game.scene（手工编排的场景图）。
+assets 下全部目录与文件的 .meta（含 textures 图片的 image/sprite-frame 子资产）、
+assets/scenes/Game.scene（手工编排的场景图）。
+
+2026-10-23 路线变更：游戏由 Bullet 3D 改为 Physics2D 2D 路线，场景为纯 Canvas/2D
+结构（无 3D 相机/光源），猫与藤编猫窝均为精灵，引导组件预绑定 11 阶猫精灵。
 
 格式依据：真实 3.8.0 工程的 package.json、scene/meta/settings 文件实测样本；
 脚本组件的 __type__ 为其 .meta uuid 的压缩形式（算法已用真实样本验证，见下方自检）。
@@ -12,6 +16,8 @@ import json
 import random
 import uuid
 from pathlib import Path
+
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 CLIENT = ROOT / "client"
@@ -70,6 +76,106 @@ def ensure_meta(asset_path: Path, importer: str, ver: str, files: list) -> str:
     return uid
 
 
+def ensure_image_meta(asset_path: Path) -> str:
+    """图片 .meta：image 导入器 + texture(6c48a) 与 sprite-frame(f9941) 子资产，
+    格式照真实 3.8.0 工程 white.png.meta 实测样本；uuid 已存在则复用。"""
+    meta_path = Path(str(asset_path) + ".meta")
+    uid = None
+    if meta_path.exists():
+        uid = read_json(meta_path)["uuid"]
+    if not uid:
+        uid = str(uuid.uuid4())
+    with Image.open(asset_path) as im:
+        w, h = im.size
+    name = asset_path.stem
+    sprite_uuid = f"{uid}@f9941"
+    write_json(
+        meta_path,
+        {
+            "ver": "1.0.26",
+            "importer": "image",
+            "imported": True,
+            "uuid": uid,
+            "files": [".json", ".png"],
+            "subMetas": {
+                "6c48a": {
+                    "importer": "texture",
+                    "uuid": f"{uid}@6c48a",
+                    "displayName": name,
+                    "id": "6c48a",
+                    "name": "texture",
+                    "userData": {
+                        "wrapModeS": "clamp-to-edge",
+                        "wrapModeT": "clamp-to-edge",
+                        "minfilter": "linear",
+                        "magfilter": "linear",
+                        "mipfilter": "none",
+                        "anisotropy": 0,
+                        "isUuid": True,
+                        "imageUuidOrDatabaseUri": uid,
+                        "visible": False,
+                    },
+                    "ver": "1.0.22",
+                    "imported": True,
+                    "files": [".json"],
+                    "subMetas": {},
+                },
+                "f9941": {
+                    "importer": "sprite-frame",
+                    "uuid": sprite_uuid,
+                    "displayName": name,
+                    "id": "f9941",
+                    "name": "spriteFrame",
+                    "userData": {
+                        "trimType": "auto",
+                        "trimThreshold": 1,
+                        "rotated": False,
+                        "offsetX": 0,
+                        "offsetY": 0,
+                        "trimX": 0,
+                        "trimY": 0,
+                        "width": w,
+                        "height": h,
+                        "rawWidth": w,
+                        "rawHeight": h,
+                        "borderTop": 0,
+                        "borderBottom": 0,
+                        "borderLeft": 0,
+                        "borderRight": 0,
+                        "packable": True,
+                        "pixelsToUnit": 100,
+                        "pivotX": 0.5,
+                        "pivotY": 0.5,
+                        "meshType": 0,
+                        "vertices": {
+                            "rawPosition": [-w / 2, -h / 2, 0, w / 2, -h / 2, 0, -w / 2, h / 2, 0, w / 2, h / 2, 0],
+                            "indexes": [0, 1, 2, 2, 1, 3],
+                            "uv": [0, h, w, h, 0, 0, w, 0],
+                            "nuv": [0, 0, 1, 0, 0, 1, 1, 1],
+                            "minPos": [-w / 2, -h / 2, 0],
+                            "maxPos": [w / 2, h / 2, 0],
+                        },
+                        "isUuid": True,
+                        "imageUuidOrDatabaseUri": f"{uid}@6c48a",
+                        "atlasUuid": "",
+                    },
+                    "ver": "1.0.12",
+                    "imported": True,
+                    "files": [".json"],
+                    "subMetas": {},
+                },
+            },
+            "userData": {
+                "fixAlphaTransparencyArtifacts": True,
+                "hasAlpha": True,
+                "type": "sprite-frame",
+                "redirect": sprite_uuid,
+            },
+        },
+    )
+    return uid
+
+
 def main() -> None:
     uuids: dict[str, str] = {}
 
@@ -82,11 +188,19 @@ def main() -> None:
         "scripts/bootstrap",
         "scripts/presentation",
         "scenes",
+        "textures",
+        "textures/cats",
     ]:
         uuids[f"dir:{d}"] = ensure_meta(ASSETS / d, "directory", "1.2.0", [])
     uuids["config"] = ensure_meta(
         ASSETS / "configs/game-config.json", "json", "2.0.1", [".json"]
     )
+    for i in range(1, 12):
+        uid = ensure_image_meta(ASSETS / f"textures/cats/cat{i:02d}.png")
+        uuids[f"cat:{i}"] = f"{uid}@f9941"
+    for name in ["basket-back", "basket-front"]:
+        uid = ensure_image_meta(ASSETS / f"textures/{name}.png")
+        uuids[f"tex:{name}"] = f"{uid}@f9941"
     ts_files = [
         "scripts/domain/Rng.ts",
         "scripts/domain/GameConfig.ts",
@@ -97,7 +211,7 @@ def main() -> None:
         "scripts/domain/MergeRules.ts",
         "scripts/application/GameSession.ts",
         "scripts/bootstrap/GameBootstrap.ts",
-        "scripts/presentation/BulletPhysicsAdapter.ts",
+        "scripts/presentation/Physics2DAdapter.ts",
         "scripts/presentation/HudView.ts",
         "scripts/presentation/InputView.ts",
     ]
@@ -294,7 +408,7 @@ def label_comp(node_id, text, font_size, col, bold=False):
 DEFAULT_SPRITE_FRAME = "f3d876b2-246f-4a8b-8a3a-712e075434c7@f9941"
 
 
-def sprite_comp(node_id, col):
+def sprite_comp(node_id, col, frame_uuid=None):
     c = comp_base("cc.Sprite", node_id)
     c.update(
         {
@@ -302,7 +416,7 @@ def sprite_comp(node_id, col):
             "_srcBlendFactor": 2,
             "_dstBlendFactor": 4,
             "_color": col,
-            "_spriteFrame": {"__uuid__": DEFAULT_SPRITE_FRAME, "__expectedType__": "cc.SpriteFrame"},
+            "_spriteFrame": {"__uuid__": frame_uuid or DEFAULT_SPRITE_FRAME, "__expectedType__": "cc.SpriteFrame"},
             "_type": 0,
             "_fillType": 0,
             "_sizeMode": 0,
@@ -388,78 +502,7 @@ def build_scene(uuids: dict) -> list:
     }
     scene_idx = add(scene_obj)
 
-    # 主光源（参数照真实 3.8.0 默认场景）
-    light_node = make_node(
-        "Main Light",
-        scene_idx,
-        1073741824,
-        (0, 0, 0),
-        euler=(-117.894, 165.091, 38.562),
-        rot=quat(-0.06397656665577071, -0.44608233363525845, -0.8239028751062036, -0.3436591377065261),
-    )
-    static_settings = add({"__type__": "cc.StaticLightSettings", "_baked": False, "_editorOnly": False, "_castShadow": False})
-    light_comp = comp_base("cc.DirectionalLight", light_node)
-    light_comp.update(
-        {
-            "_color": color(255, 250, 240),
-            "_useColorTemperature": False,
-            "_colorTemperature": 6550,
-            "_staticSettings": ref(static_settings),
-            "_visibility": -325058561,
-            "_illuminanceHDR": 65000,
-            "_illuminance": 65000,
-            "_illuminanceLDR": 1.6927083333333335,
-            "_shadowEnabled": False,
-            "_shadowPcf": 0,
-            "_shadowBias": 0.00001,
-            "_shadowNormalBias": 0,
-            "_shadowSaturation": 1,
-            "_shadowDistance": 50,
-            "_shadowInvisibleOcclusionRange": 200,
-            "_csmLevel": 4,
-            "_csmLayerLambda": 0.75,
-            "_csmOptimizationMode": 2,
-            "_csmAdvancedOptions": False,
-            "_csmLayersTransition": False,
-            "_csmTransitionRange": 0.05,
-            "_shadowFixedArea": False,
-            "_shadowNear": 0.1,
-            "_shadowFar": 10,
-            "_shadowOrthoSize": 5,
-        }
-    )
-    add_comp(light_node, light_comp)
-
-    # 主相机：透视 FOV 30（art/scene-spec.json），位于玩法平面正前方
-    cam_node = make_node("Main Camera", scene_idx, 1073741824, (0, 3.6, 14))
-    cam_comp = comp_base("cc.Camera", cam_node)
-    cam_comp.update(
-        {
-            "_projection": 1,
-            "_priority": 0,
-            "_fov": 30,
-            "_fovAxis": 0,
-            "_orthoHeight": 10,
-            "_near": 1,
-            "_far": 100,
-            "_color": color(51, 51, 51),
-            "_depth": 1,
-            "_stencil": 0,
-            "_clearFlags": 14,
-            "_rect": {"__type__": "cc.Rect", "x": 0, "y": 0, "width": 1, "height": 1},
-            "_aperture": 19,
-            "_shutter": 7,
-            "_iso": 0,
-            "_screenScale": 1,
-            "_visibility": 1822425087,
-            "_targetTexture": None,
-            "_postProcess": None,
-            "_usePostProcess": False,
-            "_cameraType": -1,
-            "_trackingType": 0,
-        }
-    )
-    add_comp(cam_node, cam_comp)
+    # 纯 2D 场景：无 3D 光源/相机，渲染由 Canvas 的正交相机承担
 
     # Canvas（设计分辨率 750×1334，局部坐标原点在画布中心）
     canvas_node = make_node("Canvas", scene_idx, 33554432, (375, 667, 0))
@@ -500,6 +543,24 @@ def build_scene(uuids: dict) -> list:
     widget(canvas_node, 45)
     input_comp = comp_base(compress_uuid(uuids["ts:scripts/presentation/InputView.ts"]), canvas_node)
     input_comp_idx = add_comp(canvas_node, input_comp)
+
+    # 2D 玩法层（均在 Canvas 下）：背景 → 猫窝后景 → WorldRoot（猫与预览）→ 危险线 → 猫窝前景
+    background = make_node("Background", canvas_node, 33554432, (0, 0, 0))
+    ui_transform(background, 750, 1334)
+    sprite_comp(background, color(246, 233, 212))
+
+    world_root = make_node("WorldRoot", canvas_node, 33554432, (0, -483, 0))
+    ui_transform(world_root, 750, 920)
+    basket_back = make_node("BasketBack", world_root, 33554432, (0, 420, 0))
+    ui_transform(basket_back, 750, 920)
+    sprite_comp(basket_back, color(255, 255, 255), uuids["tex:basket-back"])
+    danger_line = make_node("DangerLine", world_root, 33554432, (0, 660, 0))
+    ui_transform(danger_line, 636, 5)
+    sprite_comp(danger_line, color(233, 133, 125, 190))
+    basket_front = make_node("BasketFront", world_root, 33554432, (0, 420, 0))
+    ui_transform(basket_front, 750, 920)
+    sprite_comp(basket_front, color(255, 255, 255), uuids["tex:basket-front"])
+
 
     # HUD 根
     hud_root = make_node("HudRoot", canvas_node, 33554432, (0, 0, 0))
@@ -563,17 +624,17 @@ def build_scene(uuids: dict) -> list:
     )
     hud_comp_idx = add_comp(hud_root, hud_comp)
 
-    # GameRoot（3D 装配）
-    game_root = make_node("GameRoot", scene_idx, 1073741824, (0, 0, 0))
-    world_root = make_node("WorldRoot", game_root, 1073741824, (0, 0, 0))
-    container_root = make_node("ContainerRoot", game_root, 1073741824, (0, 0, 0))
+    game_root = make_node("GameRoot", canvas_node, 33554432, (0, 0, 0))
     boot_comp = comp_base(compress_uuid(uuids["ts:scripts/bootstrap/GameBootstrap.ts"]), game_root)
     boot_comp.update(
         {
             "configAsset": {"__uuid__": uuids["config"], "__expectedType__": "cc.JsonAsset"},
             "worldRoot": ref(world_root),
-            "containerRoot": ref(container_root),
-            "catPrefab": None,
+            "containerRoot": ref(world_root),
+            "catSprites": [
+                {"__uuid__": uuids[f"cat:{i}"], "__expectedType__": "cc.SpriteFrame"}
+                for i in range(1, 12)
+            ],
             "hud": ref(hud_comp_idx),
             "input": ref(input_comp_idx),
         }
@@ -725,7 +786,15 @@ def validate_scene(scene: list, uuids: dict) -> None:
     assert scene[1]["_id"] == uuids["scene"], "场景 _id 与 meta uuid 不一致"
     boot = next(o for o in scene if o.get("__type__") == compress_uuid(uuids["ts:scripts/bootstrap/GameBootstrap.ts"]))
     assert boot["configAsset"]["__uuid__"] == uuids["config"], "configAsset 绑定不一致"
-    print("场景一致性校验通过：__id__ 引用、父子/组件对称、脚本绑定、uuid 对齐均无误")
+    # 2D 路线专项：无 3D 光源/网格、单相机（Canvas 正交）、11 阶精灵齐全、篮图绑定正确、无 catPrefab 残留
+    assert "cc.DirectionalLight" not in types and "cc.MeshRenderer" not in types, "场景仍含 3D 组件"
+    assert [o.get("__type__") for o in scene].count("cc.Camera") == 1, "2D 场景应只有 Canvas 的正交相机"
+    assert "catPrefab" not in boot, "GameBootstrap 仍有 catPrefab 旧绑定"
+    cats = boot["catSprites"]
+    assert len(cats) == 11 and all(cats[i - 1]["__uuid__"] == uuids[f"cat:{i}"] for i in range(1, 12)), "catSprites 绑定不一致"
+    frames = {o["_spriteFrame"]["__uuid__"] for o in scene if o.get("__type__") == "cc.Sprite" and "_spriteFrame" in o}
+    assert uuids["tex:basket-back"] in frames and uuids["tex:basket-front"] in frames, "猫窝精灵未绑定到场景"
+    print("场景一致性校验通过：__id__ 引用、父子/组件对称、脚本绑定、uuid 对齐、2D 专项均无误")
 
 
 if __name__ == "__main__":

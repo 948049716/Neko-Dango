@@ -1,8 +1,8 @@
-import { _decorator, Component, JsonAsset, Node, PhysicsSystem, Prefab, sys, Vec3 } from "cc";
+import { _decorator, Component, JsonAsset, Node, PhysicsSystem2D, SpriteFrame, sys, Vec2 } from "cc";
 import { GameSession } from "../application/GameSession";
 import { catByLevel, GameConfig, validateConfig } from "../domain/GameConfig";
 import { DomainEvent } from "../domain/Types";
-import { BulletPhysicsAdapter } from "../presentation/BulletPhysicsAdapter";
+import { Physics2DAdapter } from "../presentation/Physics2DAdapter";
 import { HudView } from "../presentation/HudView";
 import { InputView } from "../presentation/InputView";
 
@@ -13,10 +13,10 @@ const TUTORIAL_FLAG_KEY = "neko-dango.tutorial-done";
 const DESIGN_WIDTH = 750;
 
 /**
- * 游戏引导（装配层）：解析配置、创建 GameSession 与 Bullet 适配，
+ * 游戏引导（装配层）：解析配置、创建 GameSession 与 2D 物理适配，
  * 以固定步进在 lateUpdate 中推进规则，并接线输入、HUD 与预览猫。
  * 局面冻结时停用物理世界，复活恢复（RunRevived）到达后再启用。
- * 相机偏航与果冻形变等表现属 M2，本类只留事件钩子位置。
+ * 2026-10-23 路线变更：物理由 Bullet 3D 改为 Physics2D（Box2D），规则层不变。
  */
 @ccclass("GameBootstrap")
 export class GameBootstrap extends Component {
@@ -29,8 +29,9 @@ export class GameBootstrap extends Component {
   @property(Node)
   containerRoot: Node | null = null;
 
-  @property(Prefab)
-  catPrefab: Prefab | null = null;
+  /** 11 阶猫精灵（下标 0 = Lv1），由场景生成器预绑定；缺失时适配层用彩色圆占位。 */
+  @property([SpriteFrame])
+  catSprites: SpriteFrame[] = [];
 
   @property(HudView)
   hud: HudView | null = null;
@@ -40,7 +41,7 @@ export class GameBootstrap extends Component {
 
   private cfg: GameConfig | null = null;
   private session: GameSession | null = null;
-  private adapter: BulletPhysicsAdapter | null = null;
+  private adapter: Physics2DAdapter | null = null;
   private previewNode: Node | null = null;
 
   private tickNo = 0;
@@ -70,16 +71,19 @@ export class GameBootstrap extends Component {
     this.cfg = cfg;
     this.aimLuX = cfg.world.containerWidthLu / 2;
 
-    const physics = PhysicsSystem.instance;
-    // 重力先沿用无头灰盒调参（2600 lu/s²），真机手感调优后可独立于规则配置调整
-    physics.gravity = new Vec3(0, -cfg.headlessSim.gravityLuS2 / 100, 0);
+    const physics = PhysicsSystem2D.instance;
+    physics.enable = true;
+    // 世界单位 = 设计像素：重力沿用无头灰盒调参 2600 lu/s²（= 2600 px/s²），手感调优后可独立调整
+    physics.gravity = new Vec2(0, -cfg.headlessSim.gravityLuS2);
     physics.fixedTimeStep = 1 / cfg.tickRate;
+    physics.maxSubSteps = 3;
 
-    this.adapter = new BulletPhysicsAdapter(cfg, this.worldRoot, this.catPrefab);
+    this.adapter = new Physics2DAdapter(cfg, this.worldRoot, this.catSprites);
     this.adapter.initStatics(this.containerRoot);
 
     this.previewNode = this.adapter.createPreviewVisual();
     this.worldRoot.addChild(this.previewNode);
+    this.previewNode.setSiblingIndex(1); // 与猫同层（BasketBack 之上、猫窝前景之下）
 
     if (this.input) {
       this.input.onAim = (designX) => {
@@ -208,7 +212,7 @@ export class GameBootstrap extends Component {
           this.dangerDeadlineTick = -1;
           break;
         default:
-          // CatFirstContact / MergeReserved 等事件的表现钩子（果冻、音效）在 M2 接入
+          // CatFirstContact / MergeReserved 等事件的表现钩子（果冻、音效）后续接入
           break;
       }
     }
@@ -231,20 +235,19 @@ export class GameBootstrap extends Component {
   }
 
   private updatePreview(): void {
-    if (!this.cfg || !this.session || !this.previewNode) return;
+    if (!this.cfg || !this.session || !this.previewNode || !this.adapter) return;
     const active = this.session.phase === "Playing";
     this.previewNode.active = active;
     if (!active) return;
     const level = this.session.preview.current.level;
-    const radiusEu = catByLevel(this.cfg, level).radiusLu / 100;
     if (level !== this.previewLevelShown) {
       this.previewLevelShown = level;
-      this.previewNode.setScale(new Vec3(radiusEu * 2, radiusEu * 2, radiusEu * 2));
+      this.adapter.setPreviewLevel(this.previewNode, level);
     }
     const clampedX = Math.min(Math.max(this.aimLuX, 0), this.cfg.world.containerWidthLu);
     this.previewNode.setPosition(
-      (clampedX - this.cfg.world.containerWidthLu / 2) / 100,
-      this.cfg.headlessSim.spawnYLu / 100,
+      clampedX - this.cfg.world.containerWidthLu / 2,
+      this.cfg.headlessSim.spawnYLu,
       0,
     );
   }
