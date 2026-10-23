@@ -1,7 +1,6 @@
 node_modules/
-dist/
-build/
-.cache/
-art/qa/
-*.log
-.dream-loop
+build-test/
+client/library/
+client/temp/
+client/local/
+.DS_Store
