@@ -4,6 +4,7 @@ import { Rng } from "../client/assets/scripts/domain/Rng";
 import { DomainEvent } from "../client/assets/scripts/domain/Types";
 import { HeadlessPhysics } from "../tests/HeadlessPhysics";
 import cfgJson from "../client/assets/configs/game-config.json";
+import { SPRITES } from "./assets-data";
 
 const cfg = cfgJson as unknown as GameConfig;
 
@@ -29,6 +30,25 @@ const COLORS = {
   gold: "#F4C75B",
   mint: "#6FA9A3",
 };
+
+// ---------- 真实美术精灵（由四视图设定表提取，见 tools_extract_sprites.py） ----------
+const spriteImgs = new Map<string, HTMLImageElement>();
+const loadedSprites = new Set<string>();
+for (const [name, uri] of Object.entries(SPRITES)) {
+  const img = new Image();
+  img.onload = () => loadedSprites.add(name);
+  img.src = uri;
+  spriteImgs.set(name, img);
+}
+let wickerPattern: CanvasPattern | null = null;
+
+function spriteOf(name: string): HTMLImageElement | null {
+  return loadedSprites.has(name) ? spriteImgs.get(name)! : null;
+}
+
+function catSprite(level: number): HTMLImageElement | null {
+  return spriteOf(`cat${String(level).padStart(2, "0")}`);
+}
 
 // ---------- 猫咪配色（按四视图近似，正式美术以 3D 模型为准） ----------
 const CAT_BODY: Record<number, string> = {
@@ -223,7 +243,7 @@ function tickOnce(): void {
 }
 
 // ---------- 猫咪绘制（Canvas 2D 灰盒形象，Soft Mochi 圆团子） ----------
-function drawCat(
+function drawCatVector(
   c: CanvasRenderingContext2D,
   level: number,
   cx: number,
@@ -376,6 +396,42 @@ function drawCat(
   c.restore();
 }
 
+function drawCatSprite(
+  c: CanvasRenderingContext2D,
+  level: number,
+  cx: number,
+  cy: number,
+  r: number,
+  squash: number,
+  alpha: number,
+): boolean {
+  const img = catSprite(level);
+  if (!img) return false;
+  const dh = r * 2 * 1.24;
+  const dw = dh * (img.naturalWidth / img.naturalHeight);
+  c.save();
+  c.globalAlpha = alpha;
+  c.translate(cx, cy);
+  c.scale(1 / Math.sqrt(squash), squash);
+  c.drawImage(img, -dw / 2, -dh / 2 - r * 0.1, dw, dh);
+  c.restore();
+  return true;
+}
+
+function drawCat(
+  c: CanvasRenderingContext2D,
+  level: number,
+  cx: number,
+  cy: number,
+  r: number,
+  squash: number,
+  alpha: number,
+): void {
+  if (!drawCatSprite(c, level, cx, cy, r, squash, alpha)) {
+    drawCatVector(c, level, cx, cy, r, squash, alpha);
+  }
+}
+
 // ---------- 场景绘制 ----------
 function roundRect(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
   c.beginPath();
@@ -385,6 +441,16 @@ function roundRect(c: CanvasRenderingContext2D, x: number, y: number, w: number,
   c.arcTo(x, y + h, x, y, r);
   c.arcTo(x, y, x + w, y, r);
   c.closePath();
+}
+
+function stitch(c: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+  c.save();
+  c.strokeStyle = "rgba(160,110,70,0.55)";
+  c.lineWidth = 2;
+  c.setLineDash([7, 6]);
+  roundRect(c, x + 6, y + 6, w - 12, h - 12, Math.max(6, r - 6));
+  c.stroke();
+  c.restore();
 }
 
 const reviveBtn = { x: 215, y: 648, w: 320, h: 78 };
@@ -398,26 +464,70 @@ function render(dt: number): void {
   bg.addColorStop(1, "#F1DFC2");
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, W, H);
+  // 窗光（左上方柔光）
+  const glow = ctx.createRadialGradient(150, 250, 30, 150, 250, 340);
+  glow.addColorStop(0, "rgba(255,244,214,0.8)");
+  glow.addColorStop(1, "rgba(255,244,214,0)");
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, 660);
 
-  // 猫窝（编织篮 + 透明窗 + 坐垫）
-  ctx.fillStyle = COLORS.honey;
+  // 猫耳（藏在窝沿之后探出）
+  const earImg = spriteOf("ear");
+  if (earImg) {
+    const ew = 128;
+    const eh = ew * (earImg.naturalHeight / earImg.naturalWidth);
+    ctx.drawImage(earImg, 62, 472 - eh, ew, eh);
+    ctx.save();
+    ctx.translate(W - 62, 472);
+    ctx.scale(-1, 1);
+    ctx.drawImage(earImg, 0, -eh, ew, eh);
+    ctx.restore();
+  }
+  // 猫窝（藤编纹理篮身 + 透明窗 + 坐垫）
+  if (!wickerPattern && loadedSprites.has("wicker")) {
+    wickerPattern = ctx.createPattern(spriteImgs.get("wicker")!, "repeat");
+  }
+  ctx.fillStyle = wickerPattern ?? COLORS.honey;
   roundRect(ctx, 38, 438, W - 76, 742, 40);
   ctx.fill();
-  ctx.strokeStyle = "rgba(122,79,34,0.45)";
+  ctx.strokeStyle = "rgba(122,79,34,0.55)";
   ctx.lineWidth = 3;
-  for (let y = 486; y < 1170; y += 44) {
-    ctx.beginPath();
-    ctx.moveTo(48, y);
-    ctx.lineTo(W - 48, y);
-    ctx.stroke();
-  }
+  ctx.stroke();
   ctx.fillStyle = "rgba(255,251,244,0.38)";
   roundRect(ctx, X0, 468, CW, BY - 468 + 2, 26);
   ctx.fill();
-  ctx.fillStyle = "rgba(243,184,198,0.75)";
+  // 两侧珊瑚靠枕
+  for (const dir of [-1, 1]) {
+    ctx.save();
+    ctx.translate(W / 2 + dir * (CW / 2 - 40), BY - 26);
+    ctx.rotate(dir * -0.32);
+    ctx.fillStyle = "#EF8F84";
+    roundRect(ctx, -17, -46, 34, 92, 17);
+    ctx.fill();
+    ctx.restore();
+  }
+  // 坐垫（奶油色 + 缝线 + 珊瑚爪印）
+  ctx.fillStyle = "#FBF0DC";
   ctx.beginPath();
-  ctx.ellipse(W / 2, BY - 12, CW / 2 - 16, 26, 0, 0, Math.PI * 2);
+  ctx.ellipse(W / 2, BY - 14, CW / 2 - 12, 30, 0, 0, Math.PI * 2);
   ctx.fill();
+  ctx.save();
+  ctx.strokeStyle = "rgba(201,138,70,0.5)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 7]);
+  ctx.beginPath();
+  ctx.ellipse(W / 2, BY - 14, CW / 2 - 26, 21, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = "rgba(233,133,125,0.85)";
+  ctx.beginPath();
+  ctx.ellipse(W / 2, BY - 10, 18, 12.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  for (const [ox, oy] of [[-27, -22], [-9, -28], [9, -28], [27, -22]] as const) {
+    ctx.beginPath();
+    ctx.ellipse(W / 2 + ox, BY + oy, 6.4, 8.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
   // 场上猫咪（按高度从低到高绘制）
   const bodies = [...physicsSnapshotBodies()].sort((a, b) => a.yLu - b.yLu);
@@ -432,6 +542,22 @@ function render(dt: number): void {
     const stretch = falling ? 1 + Math.min(Math.abs(b.vyLuS) / 9000, 0.1) : 1;
     drawCat(ctx, e.level, X0 + b.xLu, BY - b.yLu, catByLevel(cfg, e.level).radiusLu, vis.s * stretch, 1);
   }
+
+  // 前窗玻璃（柔光 + 斜向反光，盖在猫咪前面）
+  ctx.save();
+  roundRect(ctx, X0, 468, CW, BY - 468 + 2, 26);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.07)";
+  ctx.fillRect(X0, 468, CW, BY - 466);
+  ctx.fillStyle = "rgba(255,255,255,0.10)";
+  ctx.beginPath();
+  ctx.moveTo(X0 + 110, BY);
+  ctx.lineTo(X0 + 330, 468);
+  ctx.lineTo(X0 + 435, 468);
+  ctx.lineTo(X0 + 215, BY);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
 
   // 警戒线
   const inDanger = deadlineTick >= 0;
@@ -571,6 +697,7 @@ function render(dt: number): void {
   ctx.strokeStyle = "rgba(90,64,56,0.2)";
   ctx.lineWidth = 2.5;
   ctx.stroke();
+  stitch(ctx, 218, 30, 314, 72, 36);
   ctx.fillStyle = COLORS.ink;
   ctx.font = "800 37px 'PingFang SC','Microsoft YaHei',sans-serif";
   ctx.textAlign = "center";
@@ -588,6 +715,7 @@ function render(dt: number): void {
   ctx.strokeStyle = "rgba(90,64,56,0.2)";
   ctx.lineWidth = 2.5;
   ctx.stroke();
+  stitch(ctx, 596, 22, 126, 106, 24);
   ctx.fillStyle = COLORS.mint;
   ctx.font = "800 21px 'PingFang SC','Microsoft YaHei',sans-serif";
   ctx.textAlign = "center";
@@ -622,11 +750,21 @@ function render(dt: number): void {
     ctx.strokeStyle = "rgba(90,64,56,0.18)";
     ctx.lineWidth = 2.5;
     ctx.stroke();
+    stitch(ctx, x, y, 158, 112, 22);
     ctx.globalAlpha = p.count === 0 ? 0.35 : 1;
-    ctx.fillStyle = p.color;
-    ctx.beginPath();
-    ctx.arc(x + 79, y + 42, 21, 0, Math.PI * 2);
-    ctx.fill();
+    const pimg = spriteOf(`prop${i + 1}`);
+    if (pimg) {
+      const box = 62;
+      const sc = Math.min(box / pimg.naturalWidth, box / pimg.naturalHeight);
+      const iw = pimg.naturalWidth * sc;
+      const ih = pimg.naturalHeight * sc;
+      ctx.drawImage(pimg, x + 79 - iw / 2, y + 40 - ih / 2, iw, ih);
+    } else {
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(x + 79, y + 42, 21, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.fillStyle = COLORS.ink;
     ctx.font = "700 22px 'PingFang SC','Microsoft YaHei',sans-serif";
     ctx.textAlign = "center";
